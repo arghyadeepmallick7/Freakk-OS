@@ -1,18 +1,22 @@
 """
-FREAKOS — Production-ready single-file Discord bot.
-Uses discord.py 2.x (NOT py-cord). Everything is inside this file.
+FREAKOS — production-ready single-file Discord bot.
+
+Uses discord.py 2.x.  Everything (database, scheduler, views, commands,
+persistent state) lives inside this file.  There are NO local imports of
+`services`, `utils`, `cogs`, `modules`, `database`, `extensions`, or
+`commands` folders.
 """
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
 import random
 import re
-import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import aiosqlite
 import discord
@@ -20,10 +24,12 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
 load_dotenv()
-
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "data/freakos.db")
+DB_PATH = os.getenv("DB_PATH", "data/freakos.db").strip() or "data/freakos.db"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,21 +38,23 @@ logging.basicConfig(
 log = logging.getLogger("freakos")
 
 
-# =====================================================================
-# Helpers
-# =====================================================================
+# ============================================================
+# FORMATTERS / HELPERS  (newline-safe — never collapse whitespace)
+# ============================================================
 
-def now_utc() -> datetime:
+def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def iso(dt: datetime) -> str:
+def to_iso(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def parse_iso(s: Optional[str]) -> Optional[datetime]:
+def from_iso(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
     try:
@@ -64,7 +72,7 @@ def fmt_dt(dt: Optional[datetime]) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def fmt_duration(seconds: int) -> str:
+def fmt_dur(seconds: int) -> str:
     seconds = int(seconds)
     if seconds < 60:
         return f"{seconds}s"
@@ -78,92 +86,130 @@ def fmt_duration(seconds: int) -> str:
     return f"{d}d {h}h" if h else f"{d}d"
 
 
-def parse_duration(s: str) -> Optional[int]:
-    """Parse strings like 10s, 5m, 2h, 1d, or combinations 1h30m into seconds."""
+_DUR_RE = re.compile(r"(\d+)\s*([smhdw])", re.I)
+
+def parse_dur(s: Optional[str]) -> Optional[int]:
     if not s:
         return None
     total = 0
     matched = False
-    for amount, unit in re.findall(r"(\d+)\s*([smhdw])", s.lower()):
+    for n, u in _DUR_RE.findall(s):
         matched = True
-        n = int(amount)
-        total += n * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+        total += int(n) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[u.lower()]
     return total if matched else None
 
 
-def apply_placeholders(text: str, **kw: Any) -> str:
-    """Replace {key} placeholders. Preserves newlines and whitespace exactly."""
-    if not text:
+_PH_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+def render(template: Optional[str], **placeholders: Any) -> str:
+    """
+    Centralized placeholder renderer.
+
+    - Never strips, splits, or joins — blank lines, indentation, and
+      trailing whitespace are preserved exactly as the administrator
+      entered them.
+    - Unknown placeholders are left untouched (no crash).
+    """
+    if template is None:
         return ""
-    out = text
-    for k, v in kw.items():
-        if v is None:
-            v = ""
-        out = out.replace("{" + k + "}", str(v))
-    return out
+    def _sub(m: re.Match) -> str:
+        key = m.group(1)
+        if key in placeholders:
+            v = placeholders[key]
+            return "" if v is None else str(v)
+        return m.group(0)
+    return _PH_RE.sub(_sub, template)
 
 
-def chunk_message(text: str, limit: int = 1990) -> list[str]:
-    """Split a message into <=limit chunks without destroying newlines."""
+def chunk_message(text: Optional[str], limit: int = 1990) -> list[str]:
+    """
+    Split a message into <= limit chunks WITHOUT altering its content.
+
+    Prefers splitting on a newline boundary so the reconstruction of all
+    returned chunks (in order) is byte-identical to the input.  Never
+    strips, collapses, or joins-with-space.
+    """
     if text is None:
+        return [""]
+    if text == "":
         return [""]
     if len(text) <= limit:
         return [text]
+
     chunks: list[str] = []
-    cur = ""
-    for line in text.split("\n"):
-        # Hard-split extremely long single lines
-        while len(line) > limit:
-            if cur:
-                chunks.append(cur)
-                cur = ""
-            chunks.append(line[:limit])
-            line = line[limit:]
-        if not cur:
-            cur = line
-        elif len(cur) + 1 + len(line) > limit:
-            chunks.append(cur)
-            cur = line
+    start = 0
+    n = len(text)
+    while start < n:
+        end = start + limit
+        if end >= n:
+            chunks.append(text[start:])
+            break
+        cut = text.rfind("\n", start, end)
+        if cut <= start:
+            cut = end  # hard cut on a very long single line
+        chunks.append(text[start:cut])
+        start = cut  # keep the newline at the start of the next chunk
+    return chunks or [""]
+
+
+async def safe_send(target, content: Optional[str] = None, *,
+                    embed: Optional[discord.Embed] = None,
+                    view: Optional[discord.ui.View] = None,
+                    ephemeral: bool = False):
+    """
+    Send `content` to a channel or interaction, splitting long messages
+    on newline boundaries.  Handles both Channel and Interaction.
+    """
+    is_interaction = isinstance(target, discord.Interaction)
+    if content is None and embed is None:
+        return
+
+    if content is None:
+        if is_interaction:
+            if target.response.is_done():
+                await target.followup.send(embed=embed, view=view, ephemeral=ephemeral)
+            else:
+                await target.response.send_message(embed=embed, view=view, ephemeral=ephemeral)
         else:
-            cur = cur + "\n" + line
-    if cur or not chunks:
-        chunks.append(cur)
-    return chunks
+            await target.send(embed=embed, view=view)
+        return
 
-
-async def send_long(interaction_or_channel, content: str, **kw):
     chunks = chunk_message(content)
-    target = interaction_or_channel
-    sent = []
     for i, c in enumerate(chunks):
-        if i == 0 and hasattr(target, "response"):
-            if not target.response.is_done():
-                await target.response.send_message(c, **kw)
-                sent.append(None)
-                continue
+        if is_interaction:
+            if i == 0:
+                if target.response.is_done():
+                    await target.followup.send(c, embed=embed, view=view, ephemeral=ephemeral)
+                else:
+                    await target.response.send_message(c, embed=embed, view=view, ephemeral=ephemeral)
+                embed = None
+                view = None
             else:
-                sent.append(await target.followup.send(c, **kw))
+                await target.followup.send(c, ephemeral=ephemeral)
         else:
-            if hasattr(target, "followup"):
-                sent.append(await target.followup.send(c, **kw))
+            if i == 0:
+                await target.send(c, embed=embed, view=view)
+                embed = None
+                view = None
             else:
-                sent.append(await target.send(c, **kw))
-    return sent
+                await target.send(c)
 
 
-def make_embed(title: str = None, description: str = None, color: int = 0x5865F2) -> discord.Embed:
-    e = discord.Embed(color=color)
+def make_embed(title: Optional[str] = None,
+               description: Optional[str] = None,
+               color: int = 0x5865F2) -> discord.Embed:
+    e = discord.Embed(color=discord.Color(color))
     if title:
         e.title = title[:256]
     if description:
         e.description = description[:4096]
-    e.timestamp = now_utc()
+    e.timestamp = utcnow()
     return e
 
 
 def is_admin_or_mod(member: discord.Member) -> bool:
-    perms = member.guild_permissions
-    return perms.administrator or perms.manage_guild or perms.moderate_members
+    p = member.guild_permissions
+    return p.administrator or p.manage_guild or p.moderate_members
 
 
 def hierarchy_ok(guild: discord.Guild, target: discord.Member) -> tuple[bool, str]:
@@ -173,22 +219,41 @@ def hierarchy_ok(guild: discord.Guild, target: discord.Member) -> tuple[bool, st
         return False, "Cannot act on the server owner."
     if target.id == me.id:
         return False, "Cannot act on myself."
-    if target.id == guild.owner_id:
-        return False, "Cannot act on the owner."
     if target.top_role >= me.top_role:
-        return False, "Target has a role equal or higher than mine."
+        return False, "Target's role is equal or higher than mine."
     return True, ""
 
 
-# =====================================================================
-# Database
-# =====================================================================
+def build_user_placeholders(user: discord.abc.User,
+                            guild: Optional[discord.Guild] = None,
+                            **extra: Any) -> dict:
+    g = guild
+    if g is None and isinstance(user, discord.Member):
+        g = user.guild
+    return {
+        "user": user.name,
+        "username": user.name,
+        "display_name": getattr(user, "display_name", user.name),
+        "mention": user.mention,
+        "user_id": str(user.id),
+        "server": g.name if g else "",
+        "server_name": g.name if g else "",
+        "server_id": str(g.id) if g else "",
+        "member_count": str(g.member_count) if g and g.member_count else "",
+        "timestamp": fmt_dt(utcnow()),
+        **extra,
+    }
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guild_config (
     guild_id INTEGER NOT NULL,
-    key TEXT NOT NULL,
-    value TEXT,
+    key      TEXT    NOT NULL,
+    value    TEXT,
     PRIMARY KEY (guild_id, key)
 );
 CREATE TABLE IF NOT EXISTS warnings (
@@ -217,16 +282,6 @@ CREATE TABLE IF NOT EXISTS timeouts (
     ends_at TEXT NOT NULL,
     dm_sent INTEGER DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS tickets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id INTEGER NOT NULL,
-    channel_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    type TEXT,
-    status TEXT DEFAULT 'open',
-    claimed_by INTEGER,
-    created_at TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS ticket_types (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id INTEGER NOT NULL,
@@ -236,6 +291,16 @@ CREATE TABLE IF NOT EXISTS ticket_types (
     support_role_id INTEGER,
     message TEXT,
     UNIQUE(guild_id, name)
+);
+CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    type TEXT,
+    status TEXT DEFAULT 'open',
+    claimed_by INTEGER,
+    created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS vouches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -327,7 +392,13 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     run_at TEXT NOT NULL,
     completed INTEGER DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(completed, run_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_due         ON scheduled_tasks(completed, run_at);
+CREATE INDEX IF NOT EXISTS idx_warn_guild_user   ON warnings(guild_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_guild_ch  ON tickets(guild_id, channel_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_user_stat ON tickets(guild_id, user_id, status);
+CREATE INDEX IF NOT EXISTS idx_vouches_guild_usr ON vouches(guild_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_guild_usr  ON orders(guild_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_timeouts_ends     ON timeouts(dm_sent, ends_at);
 """
 
 
@@ -337,7 +408,7 @@ class Database:
         self.conn: Optional[aiosqlite.Connection] = None
         self._lock = asyncio.Lock()
 
-    async def connect(self):
+    async def connect(self) -> None:
         d = os.path.dirname(os.path.abspath(self.path))
         if d:
             os.makedirs(d, exist_ok=True)
@@ -345,25 +416,23 @@ class Database:
         self.conn.row_factory = aiosqlite.Row
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.execute("PRAGMA foreign_keys=ON")
+        await self.conn.execute("PRAGMA busy_timeout=5000")
         await self.conn.executescript(SCHEMA)
         await self.conn.commit()
-        log.info("Database ready at %s", self.path)
+        log.info("Database ready: %s", os.path.abspath(self.path))
 
-    async def close(self):
+    async def close(self) -> None:
         if self.conn:
-            await self.conn.close()
+            try:
+                await self.conn.close()
+            except Exception:
+                pass
 
     async def execute(self, sql: str, params: tuple = ()) -> int:
         async with self._lock:
             cur = await self.conn.execute(sql, params)
             await self.conn.commit()
-            return cur.lastrowid
-
-    async def executemany(self, sql: str, seq):
-        async with self._lock:
-            cur = await self.conn.executemany(sql, seq)
-            await self.conn.commit()
-            return cur.rowcount
+            return cur.lastrowid or 0
 
     async def fetchone(self, sql: str, params: tuple = ()) -> Optional[aiosqlite.Row]:
         async with self._lock:
@@ -376,14 +445,14 @@ class Database:
             return await cur.fetchall()
 
     # ---- config helpers ----
-    async def get_config(self, guild_id: int, key: str, default=None):
+    async def get_cfg(self, guild_id: int, key: str, default: Any = None) -> Any:
         row = await self.fetchone(
             "SELECT value FROM guild_config WHERE guild_id=? AND key=?",
             (guild_id, key),
         )
         return row["value"] if row else default
 
-    async def set_config(self, guild_id: int, key: str, value):
+    async def set_cfg(self, guild_id: int, key: str, value: Any) -> None:
         if value is None:
             await self.execute(
                 "DELETE FROM guild_config WHERE guild_id=? AND key=?",
@@ -396,8 +465,8 @@ class Database:
                 (guild_id, key, str(value)),
             )
 
-    async def get_json(self, guild_id: int, key: str, default=None):
-        v = await self.get_config(guild_id, key)
+    async def get_json(self, guild_id: int, key: str, default: Any = None) -> Any:
+        v = await self.get_cfg(guild_id, key)
         if v is None:
             return default
         try:
@@ -405,45 +474,65 @@ class Database:
         except Exception:
             return default
 
-    async def set_json(self, guild_id: int, key: str, value):
-        await self.set_config(guild_id, key, json.dumps(value))
+    async def set_json(self, guild_id: int, key: str, value: Any) -> None:
+        await self.set_cfg(guild_id, key, json.dumps(value))
 
 
-# =====================================================================
-# Scheduler
-# =====================================================================
+# ============================================================
+# SCHEDULER
+# ============================================================
 
 class Scheduler:
+    """
+    One-shot persistent task queue backed by SQLite.
+
+    - Started exactly once via `start()`.
+    - Cancels cleanly via `stop()`.
+    - Pending tasks are re-loaded and executed on restart.
+    """
+
     def __init__(self, bot: "Freakos"):
         self.bot = bot
         self._wake = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
-    def start(self):
+    def start(self) -> None:
+        if self._task and not self._task.done():
+            return
         self._task = asyncio.create_task(self._run(), name="freakos-scheduler")
 
-    async def stop(self):
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+    async def stop(self) -> None:
+        if not self._task:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        self._task = None
 
-    async def schedule(self, task_type: str, run_at: datetime, payload: dict = None,
-                       guild_id: int = None) -> int:
+    def wake(self) -> None:
+        self._wake.set()
+
+    async def schedule(self, task_type: str, run_at: datetime,
+                       payload: Optional[dict] = None,
+                       guild_id: Optional[int] = None) -> int:
         tid = await self.bot.db.execute(
             "INSERT INTO scheduled_tasks (task_type, guild_id, payload, run_at) "
             "VALUES (?, ?, ?, ?)",
-            (task_type, guild_id, json.dumps(payload or {}), iso(run_at)),
+            (task_type, guild_id, json.dumps(payload or {}), to_iso(run_at)),
         )
-        self._wake.set()
+        self.wake()
         return tid
 
-    def wake(self):
-        self._wake.set()
+    async def cancel_pending(self, task_type: str, payload_like: str) -> None:
+        await self.bot.db.execute(
+            "UPDATE scheduled_tasks SET completed=1 "
+            "WHERE completed=0 AND task_type=? AND payload LIKE ?",
+            (task_type, payload_like),
+        )
 
-    async def _run(self):
+    async def _run(self) -> None:
         await self.bot.wait_until_ready()
         while True:
             try:
@@ -454,19 +543,22 @@ class Scheduler:
                 if row is None:
                     self._wake.clear()
                     try:
-                        await asyncio.wait_for(self._wake.wait(), timeout=300)
+                        await asyncio.wait_for(self._wake.wait(), timeout=60)
                     except asyncio.TimeoutError:
                         pass
                     continue
-                run_at = parse_iso(row["run_at"]) or now_utc()
-                delay = (run_at - now_utc()).total_seconds()
+
+                run_at = from_iso(row["run_at"]) or utcnow()
+                delay = (run_at - utcnow()).total_seconds()
                 if delay > 0:
                     self._wake.clear()
                     try:
-                        await asyncio.wait_for(self._wake.wait(), timeout=min(delay, 60))
+                        await asyncio.wait_for(self._wake.wait(),
+                                               timeout=min(delay, 60))
                     except asyncio.TimeoutError:
                         pass
                     continue
+
                 await self._execute(row)
                 await self.bot.db.execute(
                     "UPDATE scheduled_tasks SET completed=1 WHERE id=?",
@@ -478,14 +570,14 @@ class Scheduler:
                 log.exception("Scheduler loop error")
                 await asyncio.sleep(5)
 
-    async def _execute(self, row):
+    async def _execute(self, row: aiosqlite.Row) -> None:
         ttype = row["task_type"]
         try:
             payload = json.loads(row["payload"] or "{}")
         except Exception:
             payload = {}
-        handler = getattr(self.bot, f"task_{ttype}", None)
-        if not handler:
+        handler: Optional[Callable] = getattr(self.bot, f"task_{ttype}", None)
+        if handler is None:
             log.warning("No handler for scheduled task %s", ttype)
             return
         try:
@@ -494,124 +586,137 @@ class Scheduler:
             log.exception("Scheduled task %s failed", ttype)
 
 
-# =====================================================================
-# Embeds helper
-# =====================================================================
+# ============================================================
+# LOGGING HELPER
+# ============================================================
 
-def build_embed_from_config(cfg: dict, defaults: discord.Embed) -> discord.Embed:
-    e = defaults
-    if cfg.get("title"):
-        e.title = str(cfg["title"])[:256]
-    if cfg.get("color") is not None:
-        try:
-            e.color = discord.Color(int(cfg["color"]))
-        except Exception:
-            pass
-    if cfg.get("footer"):
-        e.set_footer(text=str(cfg["footer"])[:2048])
-    if cfg.get("image"):
-        e.set_image(url=str(cfg["image"]))
-    if cfg.get("thumbnail"):
-        e.set_thumbnail(url=str(cfg["thumbnail"]))
-    return e
+async def log_guild(bot: "Freakos", guild: Optional[discord.Guild],
+                    event_key: str, title: str, description: str,
+                    color: int = 0x5865F2) -> None:
+    if not guild:
+        return
+    if await bot.db.get_cfg(guild.id, "logging.enabled", "0") != "1":
+        return
+    ch_id = await bot.db.get_cfg(guild.id, "logging.channel")
+    if not ch_id:
+        return
+    events = await bot.db.get_json(guild.id, "logging.events", default=[])
+    if event_key not in events:
+        return
+    ch = guild.get_channel(int(ch_id))
+    if not ch or not isinstance(ch, discord.TextChannel):
+        return
+    try:
+        await ch.send(embed=make_embed(title=title, description=description,
+                                       color=color))
+    except Exception:
+        log.exception("log_guild send failed")
 
 
-# =====================================================================
-# Persistent Views
-# =====================================================================
+# ============================================================
+# PERSISTENT VIEWS
+# ============================================================
+
+# --- Ticket panel (opens the type picker) ---
 
 class TicketCreateButton(discord.ui.View):
-    """Persistent 'Open Ticket' button that shows a type select on click."""
+    """Persistent 'Open Ticket' button — one global instance."""
+
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.primary,
                        custom_id="freakos:ticket:create", emoji="🎫")
-    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if not guild:
+    async def create(self, interaction: discord.Interaction, _):
+        if not interaction.guild:
             return
         rows = await interaction.client.db.fetchall(
             "SELECT name, emoji FROM ticket_types WHERE guild_id=? ORDER BY id",
-            (guild.id,),
+            (interaction.guild.id,),
         )
         if not rows:
-            await interaction.response.send_message(
+            return await interaction.response.send_message(
                 "No ticket types configured. Ask an admin to run `/ticket type`.",
                 ephemeral=True,
             )
-            return
-        opts = []
-        for r in rows[:25]:
-            opts.append(discord.SelectOption(
+        opts = [
+            discord.SelectOption(
                 label=r["name"][:100],
-                emoji=(r["emoji"] or None),
                 value=r["name"][:100],
-            ))
+                emoji=(r["emoji"] or None),
+            )
+            for r in rows[:25]
+        ]
         select = discord.ui.Select(placeholder="Pick a ticket type…", options=opts)
 
-        async def cb(sel_interaction: discord.Interaction):
-            await _open_ticket(sel_interaction, sel_interaction.data["values"][0])
+        async def cb(sel: discord.Interaction):
+            await open_ticket(sel, sel.data["values"][0])
 
         select.callback = cb
-        view = discord.ui.View(timeout=60)
-        view.add_item(select)
+        v = discord.ui.View(timeout=60)
+        v.add_item(select)
         await interaction.response.send_message(
-            "Choose a ticket type to open:", view=view, ephemeral=True
+            "Choose a ticket type to open:", view=v, ephemeral=True
         )
 
 
+# --- Ticket management view (single global instance; resolves by channel) ---
+
 class TicketManageView(discord.ui.View):
-    """Buttons inside a ticket channel."""
-    def __init__(self, ticket_id: int):
+    """Persistent buttons shown inside every ticket channel."""
+
+    def __init__(self):
         super().__init__(timeout=None)
-        self.ticket_id = ticket_id
+
+    async def _lookup(self, interaction: discord.Interaction):
+        return await interaction.client.db.fetchone(
+            "SELECT * FROM tickets WHERE channel_id=?", (interaction.channel.id,)
+        )
 
     @discord.ui.button(label="Claim", style=discord.ButtonStyle.success,
                        custom_id="freakos:ticket:claim")
     async def claim(self, interaction: discord.Interaction, _):
-        row = await interaction.client.db.fetchone(
-            "SELECT * FROM tickets WHERE id=?", (self.ticket_id,)
-        )
+        row = await self._lookup(interaction)
         if not row:
-            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
+            return await interaction.response.send_message("Not a ticket channel.", ephemeral=True)
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
+        if row["claimed_by"] == interaction.user.id:
+            return await interaction.response.send_message(
+                "You already claimed this ticket.", ephemeral=True)
         await interaction.client.db.execute(
             "UPDATE tickets SET claimed_by=? WHERE id=?",
-            (interaction.user.id, self.ticket_id),
+            (interaction.user.id, row["id"]),
         )
-        await interaction.response.send_message(
-            f"✅ Claimed by {interaction.user.mention}"
-        )
+        await interaction.response.send_message(f"✅ Claimed by {interaction.user.mention}")
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary,
                        custom_id="freakos:ticket:close")
     async def close(self, interaction: discord.Interaction, _):
-        row = await interaction.client.db.fetchone(
-            "SELECT * FROM tickets WHERE id=?", (self.ticket_id,)
-        )
+        row = await self._lookup(interaction)
         if not row:
-            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
+            return await interaction.response.send_message("Not a ticket channel.", ephemeral=True)
         if interaction.user.id != row["user_id"] and not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("Not allowed.", ephemeral=True)
         await interaction.client.db.execute(
-            "UPDATE tickets SET status='closed' WHERE id=?", (self.ticket_id,)
-        )
+            "UPDATE tickets SET status='closed' WHERE id=?", (row["id"],))
         try:
             ow = interaction.channel.overwrites_for(interaction.guild.default_role)
             ow.send_messages = False
-            await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
+            await interaction.channel.set_permissions(
+                interaction.guild.default_role, overwrite=ow)
         except Exception:
             pass
         await interaction.response.send_message("🔒 Ticket closed.")
 
 
-async def _open_ticket(interaction: discord.Interaction, ttype: str):
+async def open_ticket(interaction: discord.Interaction, ttype: str) -> None:
     guild = interaction.guild
     if not guild:
         return
     db: Database = interaction.client.db
+    bot: "Freakos" = interaction.client
+
     row = await db.fetchone(
         "SELECT * FROM ticket_types WHERE guild_id=? AND name=?",
         (guild.id, ttype),
@@ -619,94 +724,99 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
     if not row:
         return await interaction.response.send_message("Type not found.", ephemeral=True)
 
-    # limit & cooldown
-    limit = int(await db.get_config(guild.id, "ticket.limit", "1") or 1)
-    open_count = await db.fetchone(
-        "SELECT COUNT(*) c FROM tickets WHERE guild_id=? AND user_id=? AND status='open'",
-        (guild.id, interaction.user.id),
-    )
-    if open_count and open_count["c"] >= limit:
-        return await interaction.response.send_message(
-            f"You already have {open_count['c']} open ticket(s).", ephemeral=True
-        )
-
-    cooldown = int(await db.get_config(guild.id, "ticket.cooldown", "0") or 0)
-    if cooldown > 0:
-        last = await db.fetchone(
-            "SELECT created_at FROM tickets WHERE guild_id=? AND user_id=? "
-            "ORDER BY id DESC LIMIT 1",
+    # Serialize per-user to prevent double-create on rapid clicks
+    lock_key = (guild.id, interaction.user.id)
+    lock = bot._ticket_locks.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        limit = int(await db.get_cfg(guild.id, "ticket.limit", "1") or 1)
+        open_count = await db.fetchone(
+            "SELECT COUNT(*) c FROM tickets "
+            "WHERE guild_id=? AND user_id=? AND status='open'",
             (guild.id, interaction.user.id),
         )
-        if last:
-            last_dt = parse_iso(last["created_at"])
-            if last_dt and (now_utc() - last_dt).total_seconds() < cooldown:
-                rem = cooldown - int((now_utc() - last_dt).total_seconds())
-                return await interaction.response.send_message(
-                    f"Cooldown: try again in {fmt_duration(rem)}.", ephemeral=True
-                )
+        if open_count and open_count["c"] >= limit:
+            return await interaction.response.send_message(
+                f"You already have {open_count['c']} open ticket(s).", ephemeral=True)
 
-    category = guild.get_channel(row["category_id"]) if row["category_id"] else None
-    support_role = guild.get_role(row["support_role_id"]) if row["support_role_id"] else None
+        cooldown = int(await db.get_cfg(guild.id, "ticket.cooldown", "0") or 0)
+        if cooldown > 0:
+            last = await db.fetchone(
+                "SELECT created_at FROM tickets WHERE guild_id=? AND user_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (guild.id, interaction.user.id),
+            )
+            if last:
+                last_dt = from_iso(last["created_at"])
+                if last_dt and (utcnow() - last_dt).total_seconds() < cooldown:
+                    rem = cooldown - int((utcnow() - last_dt).total_seconds())
+                    return await interaction.response.send_message(
+                        f"Cooldown: try again in {fmt_dur(rem)}.", ephemeral=True)
 
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        interaction.user: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, attach_files=True, read_message_history=True
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, manage_channels=True, manage_permissions=True
-        ),
-    }
-    if support_role:
-        overwrites[support_role] = discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, read_message_history=True
+        category = guild.get_channel(row["category_id"]) if row["category_id"] else None
+        support_role = guild.get_role(row["support_role_id"]) if row["support_role_id"] else None
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True,
+                attach_files=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True,
+                manage_channels=True, manage_permissions=True),
+        }
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True)
+
+        try:
+            channel = await guild.create_text_channel(
+                name=f"ticket-{interaction.user.name}"[:90],
+                category=category if isinstance(category, discord.CategoryChannel) else None,
+                overwrites=overwrites,
+                reason=f"Ticket by {interaction.user}",
+            )
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "I lack permission to create the ticket channel.", ephemeral=True)
+
+        tid = await db.execute(
+            "INSERT INTO tickets (guild_id, channel_id, user_id, type, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'open', ?)",
+            (guild.id, channel.id, interaction.user.id, ttype, to_iso(utcnow())),
         )
 
-    try:
-        channel = await guild.create_text_channel(
-            name=f"ticket-{interaction.user.name}"[:90],
-            category=category,
-            overwrites=overwrites,
-            reason=f"Ticket by {interaction.user}",
+        body = row["message"] or (
+            f"Hey {interaction.user.mention}, thanks for opening a **{ttype}** ticket!\n\n"
+            "Support will be with you shortly. Please describe your issue."
         )
-    except discord.Forbidden:
-        return await interaction.response.send_message(
-            "I lack permission to create the ticket channel.", ephemeral=True
-        )
+        embed = make_embed(title=f"Ticket #{tid} — {ttype}", description=body)
+        try:
+            await channel.send(content=interaction.user.mention, embed=embed,
+                               view=TicketManageView())
+        except Exception:
+            log.exception("Failed to send ticket intro")
 
-    tid = await db.execute(
-        "INSERT INTO tickets (guild_id, channel_id, user_id, type, status, created_at) "
-        "VALUES (?, ?, ?, ?, 'open', ?)",
-        (guild.id, channel.id, interaction.user.id, ttype, iso(now_utc())),
-    )
+        await interaction.response.send_message(
+            f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        await log_guild(bot, guild, "tickets", "Ticket Opened",
+                        f"{interaction.user.mention} opened `{ttype}` → {channel.mention}")
 
-    body = row["message"] or (
-        f"Hey {interaction.user.mention}, thanks for opening a **{ttype}** ticket!\n\n"
-        "Support will be with you shortly. Please describe your issue."
-    )
-    embed = make_embed(title=f"Ticket #{tid} — {ttype}", description=body)
-    view = TicketManageView(tid)
-    try:
-        await channel.send(content=interaction.user.mention, embed=embed, view=view)
-    except Exception:
-        pass
-    await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
 
-    # logging
-    await _log_guild(interaction.client, guild, "tickets", "Ticket Opened",
-                     f"{interaction.user.mention} opened `{ttype}` → {channel.mention}")
-
+# --- Reaction / button roles ---
 
 class ReactionRoleView(discord.ui.View):
-    """One persistent view per panel with buttons/select loaded from DB."""
+    """Persistent view — one instance per panel; custom_ids include the panel id."""
+
     def __init__(self, panel_id: int, roles: list[dict], mode: str = "button"):
         super().__init__(timeout=None)
         self.panel_id = panel_id
         if mode == "select":
             opts = [
-                discord.SelectOption(label=r["label"][:100] or f"Role {r['role_id']}",
-                                     value=str(r["role_id"]),
-                                     emoji=r.get("emoji") or None)
+                discord.SelectOption(
+                    label=(r["label"] or f"Role {r['role_id']}")[:100],
+                    value=str(r["role_id"]),
+                    emoji=r.get("emoji") or None,
+                )
                 for r in roles[:25]
             ]
             if opts:
@@ -736,14 +846,15 @@ class ReactionRoleView(discord.ui.View):
     async def _select_cb(self, interaction: discord.Interaction):
         selected = {int(v) for v in interaction.data.get("values", [])}
         rows = await interaction.client.db.fetchall(
-            "SELECT role_id FROM reaction_roles WHERE panel_id=?", (self.panel_id,)
-        )
+            "SELECT role_id FROM reaction_roles WHERE panel_id=?", (self.panel_id,))
         all_ids = {r["role_id"] for r in rows}
         to_add = selected
         to_remove = all_ids - selected
         try:
-            add_roles = [interaction.guild.get_role(i) for i in to_add if interaction.guild.get_role(i)]
-            rem_roles = [interaction.guild.get_role(i) for i in to_remove if interaction.guild.get_role(i)]
+            add_roles = [interaction.guild.get_role(i) for i in to_add
+                         if interaction.guild.get_role(i)]
+            rem_roles = [interaction.guild.get_role(i) for i in to_remove
+                         if interaction.guild.get_role(i)]
             if add_roles:
                 await interaction.user.add_roles(*add_roles, reason="Reaction role")
             if rem_roles:
@@ -753,7 +864,7 @@ class ReactionRoleView(discord.ui.View):
             await interaction.response.send_message("Missing permissions.", ephemeral=True)
 
 
-async def _toggle_role(interaction: discord.Interaction, role_id: int):
+async def _toggle_role(interaction: discord.Interaction, role_id: int) -> None:
     role = interaction.guild.get_role(role_id)
     if not role:
         return await interaction.response.send_message("Role no longer exists.", ephemeral=True)
@@ -766,31 +877,31 @@ async def _toggle_role(interaction: discord.Interaction, role_id: int):
             await interaction.response.send_message(f"Added {role.mention}.", ephemeral=True)
     except discord.Forbidden:
         await interaction.response.send_message(
-            "I lack permission (check role hierarchy).", ephemeral=True
-        )
+            "I lack permission (check role hierarchy).", ephemeral=True)
 
+
+# --- Giveaway entry view (single global instance; resolves by message) ---
 
 class GiveawayView(discord.ui.View):
-    def __init__(self, giveaway_id: int):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.giveaway_id = giveaway_id
 
     @discord.ui.button(label="Enter", style=discord.ButtonStyle.success, emoji="🎉",
                        custom_id="freakos:gw:enter")
     async def enter(self, interaction: discord.Interaction, _):
         gw = await interaction.client.db.fetchone(
-            "SELECT * FROM giveaways WHERE id=?", (self.giveaway_id,)
-        )
+            "SELECT * FROM giveaways WHERE message_id=?", (interaction.message.id,))
         if not gw or gw["ended"]:
             return await interaction.response.send_message("Giveaway ended.", ephemeral=True)
         await interaction.client.db.execute(
             "INSERT OR IGNORE INTO giveaway_entries (giveaway_id, user_id) VALUES (?, ?)",
-            (self.giveaway_id, interaction.user.id),
+            (gw["id"], interaction.user.id),
         )
         await interaction.response.send_message("✅ Entered!", ephemeral=True)
 
 
-# Shop/buy uses modals dynamically; no persistent view needed beyond panels
+# --- Shop panel (single global instance) ---
+
 class ShopPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -799,7 +910,8 @@ class ShopPanelView(discord.ui.View):
                        emoji="🛒", custom_id="freakos:shop:browse")
     async def browse(self, interaction: discord.Interaction, _):
         rows = await interaction.client.db.fetchall(
-            "SELECT id, name, price, stock, active FROM shop_products WHERE guild_id=? ORDER BY id",
+            "SELECT id, name, price, stock, active FROM shop_products "
+            "WHERE guild_id=? ORDER BY id",
             (interaction.guild.id,),
         )
         if not rows:
@@ -809,7 +921,7 @@ class ShopPanelView(discord.ui.View):
             stock = "∞" if r["stock"] < 0 else r["stock"]
             flag = "✅" if r["active"] else "❌"
             lines.append(f"{flag} `#{r['id']}` **{r['name']}** — {r['price']} (stock {stock})")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await safe_send(interaction, "\n".join(lines), ephemeral=True)
 
     @discord.ui.button(label="Buy", style=discord.ButtonStyle.success,
                        emoji="💳", custom_id="freakos:shop:buy")
@@ -830,61 +942,124 @@ class BuyModal(discord.ui.Modal, title="Buy Product"):
         db: Database = interaction.client.db
         p = await db.fetchone(
             "SELECT * FROM shop_products WHERE id=? AND guild_id=?",
-            (pid, interaction.guild.id),
-        )
+            (pid, interaction.guild.id))
         if not p or not p["active"]:
             return await interaction.response.send_message("Product not available.", ephemeral=True)
         if p["stock"] >= 0 and p["stock"] < qty:
             return await interaction.response.send_message("Not enough stock.", ephemeral=True)
-        total = p["price"] * qty
+        total = float(p["price"]) * qty
         oid = await db.execute(
-            "INSERT INTO orders (guild_id, user_id, product_id, quantity, price, status, created_at, updated_at) "
+            "INSERT INTO orders (guild_id, user_id, product_id, quantity, price, "
+            "status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
             (interaction.guild.id, interaction.user.id, pid, qty, total,
-             iso(now_utc()), iso(now_utc())),
+             to_iso(utcnow()), to_iso(utcnow())),
         )
         if p["stock"] >= 0:
-            await db.execute(
-                "UPDATE shop_products SET stock=stock-? WHERE id=?", (qty, pid)
-            )
+            await db.execute("UPDATE shop_products SET stock=stock-? WHERE id=?",
+                             (qty, pid))
         await interaction.response.send_message(
             f"✅ Order `#{oid}` created for {qty}× **{p['name']}** — total {total}.\n"
             "Await payment instructions from staff.",
             ephemeral=True,
         )
-        await _log_guild(interaction.client, interaction.guild, "shop",
-                         "New Order",
-                         f"{interaction.user.mention} ordered `#{oid}` ({qty}× {p['name']}).")
+        await log_guild(interaction.client, interaction.guild, "shop", "New Order",
+                        f"{interaction.user.mention} ordered `#{oid}` "
+                        f"({qty}× {p['name']}).")
 
 
-# =====================================================================
-# Logging helper
-# =====================================================================
+# ============================================================
+# CONFIGURED-MESSAGE RENDERERS  (shared by events + test commands)
+# ============================================================
 
-async def _log_guild(bot: "Freakos", guild: discord.Guild, event_key: str,
-                     title: str, description: str, color: int = 0x5865F2):
-    if not guild:
+async def _render_configured(bot: "Freakos", guild: discord.Guild,
+                             cfg_base: str, channel_id_key: str,
+                             default_tpl: str, **extra_ph) -> Optional[tuple[discord.TextChannel, str, Optional[dict]]]:
+    """Build the (channel, rendered_text, embed_cfg) for a system.  Returns None if not sendable."""
+    ch_id = await bot.db.get_cfg(guild.id, channel_id_key)
+    if not ch_id:
+        return None
+    ch = guild.get_channel(int(ch_id))
+    if not isinstance(ch, discord.TextChannel):
+        return None
+    tpl = await bot.db.get_cfg(guild.id, cfg_base) or default_tpl
+    rendered = render(tpl, **extra_ph)
+    embed_cfg = await bot.db.get_json(guild.id, cfg_base + "_embed", default=None)
+    return ch, rendered, embed_cfg
+
+
+def _apply_embed_cfg(base: discord.Embed, cfg: Optional[dict]) -> discord.Embed:
+    if not cfg:
+        return base
+    if cfg.get("title"):
+        base.title = str(cfg["title"])[:256]
+    if cfg.get("footer"):
+        base.set_footer(text=str(cfg["footer"])[:2048])
+    if cfg.get("image"):
+        base.set_image(url=str(cfg["image"]))
+    if cfg.get("thumbnail"):
+        base.set_thumbnail(url=str(cfg["thumbnail"]))
+    if cfg.get("color") is not None:
+        try:
+            base.color = discord.Color(int(cfg["color"]))
+        except Exception:
+            pass
+    return base
+
+
+async def send_welcome(bot: "Freakos", member: discord.Member) -> None:
+    guild = member.guild
+    if await bot.db.get_cfg(guild.id, "welcome.enabled", "0") != "1":
         return
-    channel_id = await bot.db.get_config(guild.id, "logging.channel")
-    if not channel_id:
+    ph = build_user_placeholders(member, guild)
+    res = await _render_configured(
+        bot, guild, "welcome.message", "welcome.channel",
+        "Welcome {mention} to **{server_name}**!", **ph,
+    )
+    if not res:
         return
-    enabled = await bot.db.get_json(guild.id, "logging.events", default=[])
-    if event_key not in enabled:
-        return
-    ch = guild.get_channel(int(channel_id))
-    if not ch:
-        return
+    ch, text, embed_cfg = res
     try:
-        await ch.send(embed=make_embed(title=title, description=description, color=color))
+        if embed_cfg:
+            e = _apply_embed_cfg(make_embed(), embed_cfg)
+            if not e.description:
+                e.description = text[:4096]
+            await ch.send(embed=e)
+        else:
+            await safe_send(ch, text)
     except Exception:
-        pass
+        log.exception("welcome send failed")
 
 
-# =====================================================================
-# Tasks (invoked by scheduler)
-# =====================================================================
+async def send_departure(bot: "Freakos", member: discord.Member) -> None:
+    guild = member.guild
+    if await bot.db.get_cfg(guild.id, "departure.enabled", "0") != "1":
+        return
+    ph = build_user_placeholders(member, guild)
+    res = await _render_configured(
+        bot, guild, "departure.message", "departure.channel",
+        "**{username}** left the server.", **ph,
+    )
+    if not res:
+        return
+    ch, text, embed_cfg = res
+    try:
+        if embed_cfg:
+            e = _apply_embed_cfg(make_embed(), embed_cfg)
+            if not e.description:
+                e.description = text[:4096]
+            await ch.send(embed=e)
+        else:
+            await safe_send(ch, text)
+    except Exception:
+        log.exception("departure send failed")
 
-async def _run_timeout_end(bot: "Freakos", payload: dict):
+
+# ============================================================
+# SCHEDULED TASK HANDLERS
+# ============================================================
+
+async def _task_timeout_end(bot: "Freakos", payload: dict) -> None:
     tid = payload.get("timeout_id")
     if not tid:
         return
@@ -895,52 +1070,54 @@ async def _run_timeout_end(bot: "Freakos", payload: dict):
     if not guild:
         await bot.db.execute("UPDATE timeouts SET dm_sent=1 WHERE id=?", (tid,))
         return
-    member = guild.get_member(row["user_id"])
-    if member:
-        # Only send if user was actually timed out and now isn't
+
+    member: Optional[discord.Member] = guild.get_member(row["user_id"])
+    if member is None:
+        try:
+            member = await guild.fetch_member(row["user_id"])
+        except (discord.NotFound, discord.HTTPException):
+            member = None
+
+    if member is not None:
+        # If the member is still timed out, reschedule instead of firing early.
         try:
             until = member.timed_out_until
-            if until and until > now_utc():
-                # still timed out, re-schedule
+            if until and until > utcnow() + timedelta(seconds=10):
                 await bot.scheduler.schedule(
-                    "timeout_end",
-                    until + timedelta(seconds=5),
-                    {"timeout_id": tid},
-                    guild.id,
+                    "timeout_end", until + timedelta(seconds=5),
+                    {"timeout_id": tid}, guild.id,
                 )
                 return
         except Exception:
             pass
-        msg = await bot.db.get_config(guild.id, "actiondm.timeout_end_msg")
-        if msg:
-            rendered = apply_placeholders(
-                msg,
-                user=member.name,
-                mention=member.mention,
-                username=member.name,
-                display_name=member.display_name,
-                server=guild.name,
+
+        tpl = await bot.db.get_cfg(guild.id, "actiondm.timeout_end_msg")
+        if tpl:
+            mod = guild.get_member(row["moderator_id"])
+            ph = build_user_placeholders(
+                member, guild,
                 reason=row["reason"] or "No reason provided.",
-                timestamp=fmt_dt(now_utc()),
+                moderator=mod.mention if mod else f"<@{row['moderator_id']}>",
                 case_id=str(tid),
-                moderator=f"<@{row['moderator_id']}>",
+                duration="—",
+                timeout_end=fmt_dt(from_iso(row["ends_at"])),
+                timestamp=fmt_dt(utcnow()),
             )
             try:
-                for chunk in chunk_message(rendered):
-                    await member.send(chunk)
+                await safe_send(member, render(tpl, **ph))
             except Exception:
                 pass
     await bot.db.execute("UPDATE timeouts SET dm_sent=1 WHERE id=?", (tid,))
 
 
-async def _run_giveaway_end(bot: "Freakos", payload: dict):
+async def _task_giveaway_end(bot: "Freakos", payload: dict) -> None:
     gid = payload.get("giveaway_id")
     if not gid:
         return
-    await _end_giveaway(bot, gid)
+    await end_giveaway(bot, gid)
 
 
-async def _run_announcement(bot: "Freakos", payload: dict):
+async def _task_announcement(bot: "Freakos", payload: dict) -> None:
     aid = payload.get("announcement_id")
     if not aid:
         return
@@ -951,62 +1128,67 @@ async def _run_announcement(bot: "Freakos", payload: dict):
     if not guild:
         await bot.db.execute("UPDATE announcements SET sent=1 WHERE id=?", (aid,))
         return
-    channel = guild.get_channel(row["channel_id"])
-    if not channel:
+    ch = guild.get_channel(row["channel_id"])
+    if not isinstance(ch, discord.TextChannel):
         await bot.db.execute("UPDATE announcements SET sent=1 WHERE id=?", (aid,))
         return
-    embed = make_embed(title=row["title"] or None, description=row["body"] or None)
+    embed = make_embed(
+        title=row["title"] or None,
+        description=row["body"] or None,
+    )
     if row["image"]:
-        embed.set_image(url=row["image"])
+        try:
+            embed.set_image(url=row["image"])
+        except Exception:
+            pass
     if row["footer"]:
-        embed.set_footer(text=row["footer"])
+        embed.set_footer(text=str(row["footer"])[:2048])
     try:
-        await channel.send(embed=embed)
+        await ch.send(embed=embed)
     except Exception:
-        log.exception("Failed to send announcement %s", aid)
+        log.exception("announcement %s failed", aid)
     await bot.db.execute("UPDATE announcements SET sent=1 WHERE id=?", (aid,))
 
 
-async def _end_giveaway(bot: "Freakos", gid: int, reroll: bool = False):
+async def end_giveaway(bot: "Freakos", gid: int, reroll: bool = False) -> None:
     row = await bot.db.fetchone("SELECT * FROM giveaways WHERE id=?", (gid,))
     if not row:
         return
+    if row["ended"] and not reroll:
+        return  # already ended (prevents duplicate end DMs)
     entries = await bot.db.fetchall(
-        "SELECT user_id FROM giveaway_entries WHERE giveaway_id=?", (gid,)
-    )
+        "SELECT user_id FROM giveaway_entries WHERE giveaway_id=?", (gid,))
     guild = bot.get_guild(row["guild_id"])
     winners_text = "No valid entries 😢"
-    winner_ids: list[int] = []
     if entries and guild:
         pool = [e["user_id"] for e in entries]
         random.shuffle(pool)
-        n = min(row["winners"], len(pool))
+        n = min(int(row["winners"]), len(pool))
         winner_ids = pool[:n]
         winners_text = ", ".join(f"<@{w}>" for w in winner_ids)
+
     channel = guild.get_channel(row["channel_id"]) if guild else None
-    if channel:
-        try:
-            if row["message_id"]:
+    if isinstance(channel, discord.TextChannel):
+        if row["message_id"]:
+            try:
                 msg = await channel.fetch_message(row["message_id"])
                 embed = msg.embeds[0] if msg.embeds else make_embed(title="Giveaway")
-                embed.title = f"🎉 Giveaway Ended — {row['prize']}"
-                embed.description = f"Winners: {winners_text}"
+                embed.title = f"🎉 Giveaway Ended — {row['prize']}"[:256]
+                embed.description = f"Winners: {winners_text}"[:4096]
                 await msg.edit(embed=embed, view=None)
-        except Exception:
-            pass
+            except Exception:
+                pass
         try:
-            await channel.send(
-                f"🎉 **{row['prize']}** ended! Winners: {winners_text}"
-            )
+            await channel.send(f"🎉 **{row['prize']}** ended! Winners: {winners_text}")
         except Exception:
             pass
     if not reroll:
         await bot.db.execute("UPDATE giveaways SET ended=1 WHERE id=?", (gid,))
 
 
-# =====================================================================
-# Bot
-# =====================================================================
+# ============================================================
+# BOT CLASS
+# ============================================================
 
 class Freakos(commands.Bot):
     def __init__(self):
@@ -1020,50 +1202,38 @@ class Freakos(commands.Bot):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.db = Database(DB_PATH)
         self.scheduler: Optional[Scheduler] = None
-        self._vc_cache: dict[int, int] = {}  # user_id -> channel_id (in memory for dedupe)
         self._spam_tracker: dict[tuple, list[float]] = {}
+        self._ticket_locks: dict[tuple, asyncio.Lock] = {}
 
     # ---------- lifecycle ----------
-    async def setup_hook(self):
+    async def setup_hook(self) -> None:
         await self.db.connect()
         self.scheduler = Scheduler(self)
         self.scheduler.start()
-        register_all_commands(self)
-        await self._restore_persistent_views()
-        await self._restore_scheduled_tasks()
 
-    async def _restore_persistent_views(self):
-        # Ticket panel
+        # Register persistent views (must be exactly one instance per custom_id).
         self.add_view(TicketCreateButton())
+        self.add_view(TicketManageView())
         self.add_view(ShopPanelView())
-        # Ticket manage views: readd per open ticket
-        rows = await self.db.fetchall("SELECT id FROM tickets WHERE status='open'")
-        for r in rows:
-            self.add_view(TicketManageView(r["id"]))
-        # Giveaways
-        gws = await self.db.fetchall("SELECT id FROM giveaways WHERE ended=0")
-        for g in gws:
-            self.add_view(GiveawayView(g["id"]))
-        # Reaction role panels
+        self.add_view(GiveawayView())
+
         panels = await self.db.fetchall("SELECT * FROM reaction_panels")
         for p in panels:
             roles = await self.db.fetchall(
                 "SELECT role_id, label, emoji FROM reaction_roles WHERE panel_id=?",
-                (p["id"],),
-            )
+                (p["id"],))
             self.add_view(ReactionRoleView(
-                p["id"],
-                [dict(r) for r in roles],
-                p["mode"] or "button",
-            ))
+                p["id"], [dict(r) for r in roles], p["mode"] or "button"))
 
-    async def _restore_scheduled_tasks(self):
-        rows = await self.db.fetchall(
-            "SELECT * FROM scheduled_tasks WHERE completed=0"
-        )
-        log.info("Restored %d pending scheduled task(s)", len(rows))
+        register_all_commands(self)
 
-    async def close(self):
+        try:
+            synced = await self.tree.sync()
+            log.info("Synced %d slash commands", len(synced))
+        except Exception:
+            log.exception("Slash-command sync failed")
+
+    async def close(self) -> None:
         try:
             if self.scheduler:
                 await self.scheduler.stop()
@@ -1071,255 +1241,216 @@ class Freakos(commands.Bot):
         finally:
             await super().close()
 
-    async def on_ready(self):
-        log.info("Logged in as %s (%s) | guilds=%d", self.user, self.user.id, len(self.guilds))
+    async def on_ready(self) -> None:
+        log.info("Logged in as %s (%s) | guilds=%d",
+                 self.user, getattr(self.user, "id", "?"), len(self.guilds))
         try:
             await self.change_presence(activity=discord.Activity(
                 type=discord.ActivityType.watching, name="over the server"))
         except Exception:
             pass
 
-    # ===== Task dispatch handlers (called by Scheduler) =====
-    async def task_timeout_end(self, payload: dict):
-        await _run_timeout_end(self, payload)
+    # ---------- scheduled-task entry points ----------
+    async def task_timeout_end(self, payload: dict) -> None:
+        await _task_timeout_end(self, payload)
 
-    async def task_giveaway_end(self, payload: dict):
-        await _run_giveaway_end(self, payload)
+    async def task_giveaway_end(self, payload: dict) -> None:
+        await _task_giveaway_end(self, payload)
 
-    async def task_announcement(self, payload: dict):
-        await _run_announcement(self, payload)
+    async def task_announcement(self, payload: dict) -> None:
+        await _task_announcement(self, payload)
 
-    # ===== Events =====
-    async def on_member_join(self, member: discord.Member):
-        guild = member.guild
-        # Welcome
-        enabled = await self.db.get_config(guild.id, "welcome.enabled", "0")
-        if enabled == "1":
-            ch_id = await self.db.get_config(guild.id, "welcome.channel")
-            ch = guild.get_channel(int(ch_id)) if ch_id else None
-            if ch:
-                msg_tpl = await self.db.get_config(guild.id, "welcome.message") or \
-                    "Welcome {mention} to **{server}**!"
-                rendered = apply_placeholders(
-                    msg_tpl,
-                    user=member.name,
-                    mention=member.mention,
-                    username=member.name,
-                    display_name=member.display_name,
-                    server=guild.name,
-                    member_count=str(guild.member_count),
-                )
-                try:
-                    for c in chunk_message(rendered):
-                        await ch.send(c)
-                except Exception:
-                    pass
+    # ---------- member events ----------
+    async def on_member_join(self, member: discord.Member) -> None:
+        try:
+            await send_welcome(self, member)
+        except Exception:
+            log.exception("welcome error")
+
         # Autorole
-        if await self.db.get_config(guild.id, "autorole.enabled", "0") == "1":
-            roles = await self.db.get_json(guild.id, "autorole.roles", default=[])
-            good = []
-            for rid in roles:
-                r = guild.get_role(rid)
-                if r and r < guild.me.top_role and not r.managed:
-                    good.append(r)
-            if good:
-                try:
+        try:
+            if await self.db.get_cfg(member.guild.id, "autorole.enabled", "0") == "1":
+                roles = await self.db.get_json(member.guild.id, "autorole.roles", default=[])
+                good = []
+                for rid in roles:
+                    r = member.guild.get_role(rid)
+                    if r and not r.managed and r < member.guild.me.top_role:
+                        good.append(r)
+                if good:
                     await member.add_roles(*good, reason="Autorole")
-                except Exception:
-                    log.exception("Autorole failed")
+        except Exception:
+            log.exception("autorole error")
+
         # Autonick
-        if await self.db.get_config(guild.id, "autonick.enabled", "0") == "1":
-            fmt = await self.db.get_config(guild.id, "autonick.format") or "{user}"
-            nick = apply_placeholders(
-                fmt, user=member.name, username=member.name,
-                display_name=member.display_name, server=guild.name,
-            )[:32]
-            try:
-                if guild.me.guild_permissions.manage_nicknames and \
-                        member.top_role < guild.me.top_role:
+        try:
+            if await self.db.get_cfg(member.guild.id, "autonick.enabled", "0") == "1":
+                fmt = await self.db.get_cfg(member.guild.id, "autonick.format") or "{user}"
+                nick = render(fmt, **build_user_placeholders(member, member.guild))
+                nick = nick[:32] or None
+                if (member.guild.me.guild_permissions.manage_nicknames
+                        and member.top_role < member.guild.me.top_role
+                        and member.id != member.guild.owner_id):
                     await member.edit(nick=nick, reason="Autonick")
-            except Exception:
-                pass
-        # Logging
-        await _log_guild(self, guild, "joins", "Member Joined",
-                         f"{member.mention} ({member})")
+        except Exception:
+            pass
 
-    async def on_member_remove(self, member: discord.Member):
-        guild = member.guild
-        if await self.db.get_config(guild.id, "departure.enabled", "0") == "1":
-            ch_id = await self.db.get_config(guild.id, "departure.channel")
-            ch = guild.get_channel(int(ch_id)) if ch_id else None
-            if ch:
-                tpl = await self.db.get_config(guild.id, "departure.message") or \
-                    "**{user}** left the server."
-                rendered = apply_placeholders(
-                    tpl, user=member.name, username=member.name,
-                    display_name=member.display_name, mention=member.mention,
-                    server=guild.name, member_count=str(guild.member_count),
-                )
-                try:
-                    for c in chunk_message(rendered):
-                        await ch.send(c)
-                except Exception:
-                    pass
-        await _log_guild(self, guild, "leaves", "Member Left",
-                         f"{member.mention} ({member})")
+        await log_guild(self, member.guild, "joins", "Member Joined",
+                        f"{member.mention} ({member})")
 
-    async def on_message_delete(self, message: discord.Message):
+    async def on_member_remove(self, member: discord.Member) -> None:
+        try:
+            await send_departure(self, member)
+        except Exception:
+            log.exception("departure error")
+        await log_guild(self, member.guild, "leaves", "Member Left",
+                        f"{member.mention} ({member})")
+
+    # ---------- message events ----------
+    async def on_message_delete(self, message: discord.Message) -> None:
         if not message.guild or message.author.bot:
             return
-        await _log_guild(self, message.guild, "messages", "Message Deleted",
-                         f"**Author:** {message.author.mention}\n"
-                         f"**Channel:** {message.channel.mention}\n"
-                         f"**Content:**\n{message.content[:1500] or '*(empty)*'}")
+        content = message.content or "*(empty)*"
+        await log_guild(self, message.guild, "messages", "Message Deleted",
+                        f"**Author:** {message.author.mention}\n"
+                        f"**Channel:** {message.channel.mention}\n"
+                        f"**Content:**\n{content[:1500]}")
 
-    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
         if not after.guild or after.author.bot or before.content == after.content:
             return
-        await _log_guild(self, after.guild, "messages", "Message Edited",
-                         f"**Author:** {after.author.mention}\n"
-                         f"**Channel:** {after.channel.mention}\n"
-                         f"**Before:**\n{before.content[:700]}\n"
-                         f"**After:**\n{after.content[:700]}")
+        await log_guild(self, after.guild, "messages", "Message Edited",
+                        f"**Author:** {after.author.mention}\n"
+                        f"**Channel:** {after.channel.mention}\n"
+                        f"**Before:**\n{(before.content or '')[:700]}\n"
+                        f"**After:**\n{(after.content or '')[:700]}")
 
+    # ---------- voice events ----------
     async def on_voice_state_update(self, member: discord.Member,
                                     before: discord.VoiceState,
-                                    after: discord.VoiceState):
+                                    after: discord.VoiceState) -> None:
         guild = member.guild
         if member.bot:
             return
         old_id = before.channel.id if before.channel else None
         new_id = after.channel.id if after.channel else None
         if old_id == new_id:
+            return  # mute/deafen/stream change — ignore
+
+        if await self.db.get_cfg(guild.id, "vcnotify.enabled", "1") != "1":
             return
-        # dedupe cache
-        self._vc_cache[member.id] = new_id or 0
 
         watch = await self.db.get_json(guild.id, "vcnotify.channels", default=[])
         if not watch:
             return
 
-        # LEAVE event for old channel (if watched)
+        # LEAVE event for source channel
         if old_id and old_id in watch:
             cfg = await self.db.get_json(guild.id, f"vcnotify.cfg.{old_id}", default={})
             if cfg.get("enabled", True):
                 target = guild.get_channel(cfg.get("target_channel_id") or 0)
-                if target:
+                if isinstance(target, discord.TextChannel):
                     tpl = cfg.get("leave_msg") or "👋 {mention} left **{channel_name}**."
-                    rendered = apply_placeholders(
-                        tpl, mention=member.mention, user=member.name,
-                        username=member.name, display_name=member.display_name,
-                        channel_name=before.channel.name, server=guild.name,
-                    )
+                    ph = build_user_placeholders(
+                        member, guild, channel_name=before.channel.name)
                     try:
-                        for c in chunk_message(rendered):
-                            await target.send(c)
+                        await safe_send(target, render(tpl, **ph))
                     except Exception:
                         pass
 
-        # JOIN event for new channel (if watched)
+        # JOIN event for destination channel
         if new_id and new_id in watch:
             cfg = await self.db.get_json(guild.id, f"vcnotify.cfg.{new_id}", default={})
             if cfg.get("enabled", True):
                 target = guild.get_channel(cfg.get("target_channel_id") or 0)
-                if target:
+                if isinstance(target, discord.TextChannel):
                     tpl = cfg.get("join_msg") or "🎧 {mention} joined **{channel_name}**."
-                    rendered = apply_placeholders(
-                        tpl, mention=member.mention, user=member.name,
-                        username=member.name, display_name=member.display_name,
-                        channel_name=after.channel.name, server=guild.name,
-                    )
+                    ph = build_user_placeholders(
+                        member, guild, channel_name=after.channel.name)
                     try:
-                        for c in chunk_message(rendered):
-                            await target.send(c)
+                        await safe_send(target, render(tpl, **ph))
                     except Exception:
                         pass
 
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
+    # ---------- message processing ----------
+    async def on_message(self, message: discord.Message) -> None:
+        if not message.guild or message.author.bot:
             return
-        # AutoMod
         try:
             await self._automod_check(message)
         except Exception:
             log.exception("automod error")
 
-        # Custom commands (text prefix: !name)
-        if message.content.startswith("!"):
+        # Text custom commands (prefix: "!")
+        if message.content.startswith("!") and isinstance(message.author, discord.Member):
             name = message.content[1:].split(" ", 1)[0].lower()
-            row = await self.db.fetchone(
-                "SELECT * FROM custom_commands WHERE guild_id=? AND name=? AND enabled=1",
-                (message.guild.id, name),
-            )
-            if row:
-                rendered = apply_placeholders(
-                    row["response"] or "",
-                    user=message.author.name, mention=message.author.mention,
-                    username=message.author.name, display_name=message.author.display_name,
-                    server=message.guild.name,
+            if name:
+                row = await self.db.fetchone(
+                    "SELECT * FROM custom_commands WHERE guild_id=? AND name=? AND enabled=1",
+                    (message.guild.id, name),
                 )
-                try:
-                    if row["embed"]:
-                        await message.channel.send(embed=make_embed(
-                            title=name.title(), description=rendered))
-                    else:
-                        for c in chunk_message(rendered):
-                            await message.channel.send(c)
-                except Exception:
-                    pass
+                if row:
+                    ph = build_user_placeholders(message.author, message.guild)
+                    text = render(row["response"] or "", **ph)
+                    try:
+                        if row["embed"]:
+                            await message.channel.send(
+                                embed=make_embed(title=name.title(), description=text[:4096]))
+                        else:
+                            await safe_send(message.channel, text)
+                    except Exception:
+                        pass
 
         await self.process_commands(message)
 
-    # ===== AutoMod =====
-    async def _automod_check(self, message: discord.Message):
+    # ---------- AutoMod ----------
+    async def _automod_check(self, message: discord.Message) -> None:
         guild = message.guild
-        if await self.db.get_config(guild.id, "automod.enabled", "0") != "1":
+        author = message.author
+        if not isinstance(author, discord.Member):
             return
-        if message.author.guild_permissions.administrator:
+        if await self.db.get_cfg(guild.id, "automod.enabled", "0") != "1":
             return
-        if message.author.id == self.user.id:
+        if author.guild_permissions.administrator or author.guild_permissions.manage_messages:
             return
+        if author.id == self.user.id:
+            return
+        # Never act against anyone above the bot
+        if author.top_role >= guild.me.top_role:
+            return
+
         whitelist = await self.db.get_json(guild.id, "automod.whitelist", default={})
-        wl_channels = set(whitelist.get("channels", []))
-        wl_roles = set(whitelist.get("roles", []))
-        if message.channel.id in wl_channels:
+        if message.channel.id in set(whitelist.get("channels", [])):
             return
-        if any(r.id in wl_roles for r in message.author.roles):
+        wl_roles = set(whitelist.get("roles", []))
+        if any(r.id in wl_roles for r in author.roles):
             return
 
         settings = await self.db.get_json(guild.id, "automod.settings", default={})
         action = settings.get("action", "delete")
-        violations = []
+        violations: list[str] = []
+        content = message.content or ""
 
-        # invites
-        if settings.get("invites", True) and re.search(
-                r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+",
-                message.content, re.I):
+        invite_re = re.compile(r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+", re.I)
+        link_re = re.compile(r"https?://\S+", re.I)
+
+        if settings.get("invites", True) and invite_re.search(content):
             violations.append("invite link")
+        elif settings.get("links", True) and link_re.search(content):
+            violations.append("link")
 
-        # links
-        if settings.get("links", True) and re.search(
-                r"https?://\S+", message.content, re.I):
-            if not re.search(r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+",
-                             message.content, re.I):
-                violations.append("link")
-
-        # banned words
         words = settings.get("words", [])
-        low = message.content.lower()
+        low = content.lower()
         for w in words:
             if w and w.lower() in low:
                 violations.append(f"banned word `{w}`")
                 break
 
-        # mentions
         if settings.get("mentions", True) and len(message.mentions) >= 5:
             violations.append("mention spam")
 
-        # spam (5 msgs / 5s)
         if settings.get("antispam", True):
-            key = (guild.id, message.author.id)
-            now = now_utc().timestamp()
+            key = (guild.id, author.id)
+            now = utcnow().timestamp()
             arr = self._spam_tracker.setdefault(key, [])
             arr.append(now)
             self._spam_tracker[key] = [t for t in arr if now - t < 5]
@@ -1330,56 +1461,51 @@ class Freakos(commands.Bot):
         if not violations:
             return
 
-        # apply action
+        # Delete the offending message first if any action involves removal
         try:
-            if action in ("delete", "warn", "timeout", "kick", "ban"):
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-            if action == "warn":
-                await self.db.execute(
-                    "INSERT INTO warnings (guild_id, user_id, moderator_id, reason, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (guild.id, message.author.id, self.user.id,
-                     f"AutoMod: {', '.join(violations)}", iso(now_utc())),
-                )
-                try:
-                    await message.channel.send(
-                        f"{message.author.mention} warning: {', '.join(violations)}",
-                        delete_after=5,
-                    )
-                except Exception:
-                    pass
-            elif action == "timeout":
-                try:
-                    await message.author.timeout(timedelta(minutes=10),
-                                                 reason=f"AutoMod: {violations}")
-                except Exception:
-                    pass
-            elif action == "kick":
-                try:
-                    await message.author.kick(reason=f"AutoMod: {violations}")
-                except Exception:
-                    pass
-            elif action == "ban":
-                try:
-                    await message.author.ban(reason=f"AutoMod: {violations}",
-                                             delete_message_days=1)
-                except Exception:
-                    pass
-            await _log_guild(self, guild, "automod", "AutoMod Action",
-                             f"{message.author.mention}: {', '.join(violations)} "
-                             f"(action: {action})",
-                             color=0xE67E22)
+            await message.delete()
         except Exception:
-            log.exception("automod action failed")
+            pass
 
-    # ===== Error handler =====
+        if action == "warn":
+            await self.db.execute(
+                "INSERT INTO warnings (guild_id, user_id, moderator_id, reason, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (guild.id, author.id, self.user.id,
+                 f"AutoMod: {', '.join(violations)}", to_iso(utcnow())),
+            )
+            try:
+                await message.channel.send(
+                    f"{author.mention} warning: {', '.join(violations)}", delete_after=5)
+            except Exception:
+                pass
+        elif action == "timeout":
+            try:
+                await author.timeout(timedelta(minutes=10),
+                                     reason=f"AutoMod: {violations}")
+            except Exception:
+                pass
+        elif action == "kick":
+            try:
+                await author.kick(reason=f"AutoMod: {violations}")
+            except Exception:
+                pass
+        elif action == "ban":
+            try:
+                await author.ban(reason=f"AutoMod: {violations}", delete_message_days=1)
+            except Exception:
+                pass
+
+        await log_guild(self, guild, "automod", "AutoMod Action",
+                        f"{author.mention}: {', '.join(violations)} (action: {action})",
+                        color=0xE67E22)
+
+    # ---------- global error handler ----------
     async def on_app_command_error(self, interaction: discord.Interaction,
-                                   error: app_commands.AppCommandError):
+                                   error: app_commands.AppCommandError) -> None:
         original = getattr(error, "original", error)
-        log.exception("Command error: %s", original)
+        log.exception("App command error: %s", original)
+
         msg = "❌ An unexpected error occurred."
         if isinstance(original, app_commands.MissingPermissions):
             msg = "❌ You lack permissions for that."
@@ -1395,12 +1521,13 @@ class Freakos(commands.Bot):
             msg = "❌ Target no longer exists."
         elif isinstance(original, discord.HTTPException):
             msg = f"❌ Discord API error: {original.status}"
-        elif isinstance(original, (commands.MemberNotFound,)):
+        elif isinstance(original, commands.MemberNotFound):
             msg = "❌ Member not found."
-        elif isinstance(original, (commands.RoleNotFound,)):
+        elif isinstance(original, commands.RoleNotFound):
             msg = "❌ Role not found."
-        elif isinstance(original, (commands.ChannelNotFound,)):
+        elif isinstance(original, commands.ChannelNotFound):
             msg = "❌ Channel not found."
+
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
@@ -1410,15 +1537,43 @@ class Freakos(commands.Bot):
             pass
 
 
-# =====================================================================
-# Command registration
-# =====================================================================
+# ============================================================
+# MODAL HELPERS
+# ============================================================
 
-def register_all_commands(bot: Freakos):
+class TextModal(discord.ui.Modal):
+    """Simple multiline input that preserves newlines exactly."""
+
+    def __init__(self, title: str, default: str, on_submit: Callable):
+        super().__init__(title=title[:45])
+        self._cb = on_submit
+        self.text = discord.ui.TextInput(
+            label="Message",
+            style=discord.TextStyle.paragraph,
+            default=default[:4000] if default else "",
+            max_length=4000,
+            required=False,
+        )
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self._cb(interaction, self.text.value)
+
+
+async def _save_and_reply(interaction: discord.Interaction, key: str, value: str) -> None:
+    # Preserve exact newlines — no strip / split / join.
+    await interaction.client.db.set_cfg(interaction.guild.id, key, value)
+    await interaction.response.send_message("✅ Saved.", ephemeral=True)
+
+
+# ============================================================
+# COMMAND REGISTRATION
+# ============================================================
+
+def register_all_commands(bot: Freakos) -> None:
     tree = bot.tree
     db = bot.db
 
-    # ---------- helpers ----------
     async def require_admin(interaction: discord.Interaction) -> bool:
         if not interaction.guild:
             await interaction.response.send_message("Guild only.", ephemeral=True)
@@ -1430,11 +1585,10 @@ def register_all_commands(bot: Freakos):
         return True
 
     # ================= GENERAL =================
+
     @tree.command(name="ping", description="Show bot latency.")
     async def ping(interaction: discord.Interaction):
-        await interaction.response.send_message(
-            f"🏓 Pong! `{round(bot.latency*1000)}ms`"
-        )
+        await interaction.response.send_message(f"🏓 Pong! `{round(bot.latency*1000)}ms`")
 
     @tree.command(name="serverinfo", description="Show server info.")
     async def serverinfo(interaction: discord.Interaction):
@@ -1461,10 +1615,10 @@ def register_all_commands(bot: Freakos):
         e.add_field(name="Created", value=fmt_dt(m.created_at), inline=True)
         if isinstance(m, discord.Member):
             e.add_field(name="Joined", value=fmt_dt(m.joined_at), inline=True)
-            roles = [r.mention for r in reversed(m.roles) if r.name != "@everyone"]
             e.add_field(name="Top Role", value=m.top_role.mention, inline=True)
+            roles = [r.mention for r in reversed(m.roles) if r.name != "@everyone"]
             if roles:
-                e.add_field(name="Roles", value=", ".join(roles[:20]), inline=False)
+                e.add_field(name="Roles", value=", ".join(roles[:20])[:1024], inline=False)
         await interaction.response.send_message(embed=e)
 
     @tree.command(name="avatar", description="Show a user's avatar.")
@@ -1503,148 +1657,157 @@ def register_all_commands(bot: Freakos):
         e = make_embed(title="FREAKOS — Commands",
                        description="Use `/` for slash commands, `!name` for custom commands.")
         for cat, names in cats.items():
-            e.add_field(name=cat, value=", ".join(f"`/{n}`" for n in names), inline=False)
+            e.add_field(name=cat,
+                        value=", ".join(f"`/{n}`" for n in names)[:1024],
+                        inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    # ================= SETUP WIZARD =================
     @tree.command(name="setup", description="Interactive setup wizard.")
     async def setup(interaction: discord.Interaction):
         if not await require_admin(interaction):
             return
         g = interaction.guild
-        lines = []
-        def status(key, default="off"):
-            return "🟢" if default == "on" else "⚪"
+        ticket_types = await db.fetchone(
+            "SELECT COUNT(*) c FROM ticket_types WHERE guild_id=?", (g.id,))
+        shop_products = await db.fetchone(
+            "SELECT COUNT(*) c FROM shop_products WHERE guild_id=?", (g.id,))
+        rr_panels = await db.fetchone(
+            "SELECT COUNT(*) c FROM reaction_panels WHERE guild_id=?", (g.id,))
+        gws = await db.fetchone(
+            "SELECT COUNT(*) c FROM giveaways WHERE guild_id=? AND ended=0", (g.id,))
+        ccs = await db.fetchone(
+            "SELECT COUNT(*) c FROM custom_commands WHERE guild_id=?", (g.id,))
+        anns = await db.fetchone(
+            "SELECT COUNT(*) c FROM announcements WHERE guild_id=? AND sent=0", (g.id,))
+
         checks = [
-            ("Welcome", await db.get_config(g.id, "welcome.enabled", "0") == "1"),
-            ("Autorole", await db.get_config(g.id, "autorole.enabled", "0") == "1"),
-            ("Autonick", await db.get_config(g.id, "autonick.enabled", "0") == "1"),
-            ("Departure", await db.get_config(g.id, "departure.enabled", "0") == "1"),
-            ("Action DMs", await db.get_config(g.id, "actiondm.enabled", "0") == "1"),
-            ("VC Notifications", bool(await db.get_json(g.id, "vcnotify.channels", default=[]))),
-            ("Tickets", bool(await db.fetchall(
-                "SELECT 1 FROM ticket_types WHERE guild_id=?", (g.id,)))),
-            ("Vouches", bool(await db.get_config(g.id, "vouch.channel"))),
-            ("Shop", bool(await db.fetchall(
-                "SELECT 1 FROM shop_products WHERE guild_id=?", (g.id,)))),
-            ("Notifications", bool(await db.get_config(g.id, "notify.channel"))),
-            ("AutoMod", await db.get_config(g.id, "automod.enabled", "0") == "1"),
-            ("Logging", bool(await db.get_config(g.id, "logging.channel"))),
-            ("Reaction Roles", bool(await db.fetchall(
-                "SELECT 1 FROM reaction_panels WHERE guild_id=?", (g.id,)))),
-            ("Giveaways", bool(await db.fetchall(
-                "SELECT 1 FROM giveaways WHERE guild_id=? AND ended=0", (g.id,)))),
-            ("Custom Commands", bool(await db.fetchall(
-                "SELECT 1 FROM custom_commands WHERE guild_id=?", (g.id,)))),
-            ("Announcements", bool(await db.fetchall(
-                "SELECT 1 FROM announcements WHERE guild_id=?", (g.id,)))),
+            ("Welcome", await db.get_cfg(g.id, "welcome.enabled", "0") == "1"),
+            ("Autorole", await db.get_cfg(g.id, "autorole.enabled", "0") == "1"),
+            ("Autonick", await db.get_cfg(g.id, "autonick.enabled", "0") == "1"),
+            ("Departure", await db.get_cfg(g.id, "departure.enabled", "0") == "1"),
+            ("Action DMs", await db.get_cfg(g.id, "actiondm.enabled", "0") == "1"),
+            ("VC Notifications",
+             bool(await db.get_json(g.id, "vcnotify.channels", default=[]))),
+            ("Tickets", ticket_types["c"] > 0),
+            ("Vouches", bool(await db.get_cfg(g.id, "vouch.channel"))),
+            ("Shop", shop_products["c"] > 0),
+            ("Notifications", bool(await db.get_cfg(g.id, "notify.channel"))),
+            ("AutoMod", await db.get_cfg(g.id, "automod.enabled", "0") == "1"),
+            ("Logging", bool(await db.get_cfg(g.id, "logging.channel"))),
+            ("Reaction Roles", rr_panels["c"] > 0),
+            ("Giveaways (open)", gws["c"] > 0),
+            ("Custom Commands", ccs["c"] > 0),
+            ("Announcements (pending)", anns["c"] > 0),
         ]
-        for name, on in checks:
-            lines.append(f"{'🟢' if on else '⚪'} **{name}**")
-        embed = make_embed(
+        lines = [f"{'🟢' if on else '⚪'} **{name}**" for name, on in checks]
+        e = make_embed(
             title="🛠 FREAKOS Setup",
             description=(
-                "Use the subcommands of each group to configure systems:\n"
-                "`/welcome`, `/autorole`, `/autonick`, `/departure`, `/actiondm`, "
-                "`/vcnotify`, `/ticket`, `/vouch`, `/shop`, `/order`, `/notify`, "
-                "`/automod`, `/logging`, `/reactionrole`, `/giveaway`, "
-                "`/customcommand`, `/announce`.\n\n"
+                "Configure each module with its own slash-command group:\n"
+                "`/welcome` `/autorole` `/autonick` `/departure` `/actiondm` `/vcnotify` "
+                "`/ticket` `/vouch` `/shop` `/order` `/notify` `/automod` `/logging` "
+                "`/reactionrole` `/giveaway` `/customcommand` `/announce`\n\n"
                 "**Current status:**\n" + "\n".join(lines)
             ),
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=e, ephemeral=True)
 
     # ================= WELCOME =================
     welcome = app_commands.Group(name="welcome", description="Welcome system")
     tree.add_command(welcome)
 
-    @welcome.command(name="setup", description="Quick setup of welcome channel.")
-    @app_commands.describe(channel="Channel for welcome messages")
+    @welcome.command(name="setup", description="Set welcome channel and enable.")
     async def w_setup(interaction: discord.Interaction, channel: discord.TextChannel):
-        if not await require_admin(interaction):
-            return
-        await db.set_config(interaction.guild.id, "welcome.channel", channel.id)
-        await db.set_config(interaction.guild.id, "welcome.enabled", "1")
+        if not await require_admin(interaction): return
+        await db.set_cfg(interaction.guild.id, "welcome.channel", channel.id)
+        await db.set_cfg(interaction.guild.id, "welcome.enabled", "1")
         await interaction.response.send_message(
             f"✅ Welcome configured to {channel.mention}.", ephemeral=True)
 
     @welcome.command(name="enable", description="Enable welcome messages.")
     async def w_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "welcome.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "welcome.enabled", "1")
         await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @welcome.command(name="disable", description="Disable welcome messages.")
     async def w_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "welcome.enabled", "0")
+        await db.set_cfg(interaction.guild.id, "welcome.enabled", "0")
         await interaction.response.send_message("✅ Disabled.", ephemeral=True)
 
     @welcome.command(name="channel", description="Set welcome channel.")
     async def w_channel(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "welcome.channel", channel.id)
-        await interaction.response.send_message(f"✅ Channel set to {channel.mention}.", ephemeral=True)
+        await db.set_cfg(interaction.guild.id, "welcome.channel", channel.id)
+        await interaction.response.send_message(
+            f"✅ Channel set to {channel.mention}.", ephemeral=True)
 
-    @welcome.command(name="message", description="Set welcome message (supports newlines).")
+    @welcome.command(name="message",
+                     description="Set welcome message (multiline supported).")
     async def w_message(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        current = await db.get_config(interaction.guild.id, "welcome.message", "") or ""
+        cur = await db.get_cfg(interaction.guild.id, "welcome.message", "") or ""
         await interaction.response.send_modal(TextModal(
-            title="Welcome Message",
-            default=current,
-            on_submit=lambda i, v: _save_and_reply(i, "welcome.message", v),
-        ))
+            title="Welcome Message", default=cur,
+            on_submit=lambda i, v: _save_and_reply(i, "welcome.message", v)))
 
-    @welcome.command(name="embed", description="Set welcome embed (title|color|footer).")
+    @welcome.command(name="embed", description="Configure welcome embed.")
+    @app_commands.describe(title="Embed title", color="Hex color (e.g. #5865F2)",
+                           footer="Footer text", image="Image URL",
+                           enabled="Use embed instead of plain text")
     async def w_embed(interaction: discord.Interaction,
+                      enabled: bool,
                       title: Optional[str] = None,
                       color: Optional[str] = None,
-                      footer: Optional[str] = None):
+                      footer: Optional[str] = None,
+                      image: Optional[str] = None):
         if not await require_admin(interaction): return
-        cfg = {"title": title, "footer": footer}
+        cfg: dict = {"enabled": enabled}
+        if title: cfg["title"] = title
+        if footer: cfg["footer"] = footer
+        if image: cfg["image"] = image
         if color:
             try:
                 cfg["color"] = int(color.replace("#", ""), 16)
             except Exception:
                 pass
-        await db.set_json(interaction.guild.id, "welcome.embed", cfg)
-        await interaction.response.send_message("✅ Welcome embed config saved.", ephemeral=True)
+        if enabled:
+            await db.set_json(interaction.guild.id, "welcome.message_embed", cfg)
+        else:
+            await db.set_cfg(interaction.guild.id, "welcome.message_embed", None)
+        await interaction.response.send_message("✅ Saved.", ephemeral=True)
 
     @welcome.command(name="test", description="Send a test welcome message.")
     async def w_test(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        ch_id = await db.get_config(interaction.guild.id, "welcome.channel")
-        ch = interaction.guild.get_channel(int(ch_id)) if ch_id else None
-        if not ch:
-            return await interaction.response.send_message("No welcome channel set.", ephemeral=True)
-        tpl = await db.get_config(interaction.guild.id, "welcome.message") or "Welcome {mention}!"
-        rendered = apply_placeholders(
-            tpl, user=interaction.user.name, mention=interaction.user.mention,
-            username=interaction.user.name, display_name=interaction.user.display_name,
-            server=interaction.guild.name, member_count=str(interaction.guild.member_count))
-        for c in chunk_message(rendered):
-            await ch.send(c)
+        if not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+        await send_welcome(bot, interaction.user)
         await interaction.response.send_message("✅ Test sent.", ephemeral=True)
 
     @welcome.command(name="reset", description="Reset welcome config.")
     async def w_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        for k in ("welcome.channel", "welcome.message", "welcome.embed", "welcome.enabled"):
-            await db.set_config(interaction.guild.id, k, None)
-        await interaction.response.send_message("✅ Welcome reset.", ephemeral=True)
+        for k in ("welcome.channel", "welcome.message",
+                  "welcome.message_embed", "welcome.enabled"):
+            await db.set_cfg(interaction.guild.id, k, None)
+        await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= AUTOROLE =================
     autorole = app_commands.Group(name="autorole", description="Autorole system")
     tree.add_command(autorole)
 
-    @autorole.command(name="setup", description="Quick enable autorole.")
-    @app_commands.describe(role="Role to give on join")
+    @autorole.command(name="setup", description="Enable autorole with a single role.")
     async def ar_setup(interaction: discord.Interaction, role: discord.Role):
         if not await require_admin(interaction): return
+        if role >= interaction.guild.me.top_role or role.managed:
+            return await interaction.response.send_message(
+                "❌ Role is higher than mine or managed.", ephemeral=True)
         await db.set_json(interaction.guild.id, "autorole.roles", [role.id])
-        await db.set_config(interaction.guild.id, "autorole.enabled", "1")
-        await interaction.response.send_message(f"✅ Autorole set to {role.mention}.", ephemeral=True)
+        await db.set_cfg(interaction.guild.id, "autorole.enabled", "1")
+        await interaction.response.send_message(
+            f"✅ Autorole set to {role.mention}.", ephemeral=True)
 
     @autorole.command(name="add", description="Add a role to autorole.")
     async def ar_add(interaction: discord.Interaction, role: discord.Role):
@@ -1675,20 +1838,20 @@ def register_all_commands(bot: Freakos):
     @autorole.command(name="enable", description="Enable autorole.")
     async def ar_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autorole.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "autorole.enabled", "1")
         await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @autorole.command(name="disable", description="Disable autorole.")
     async def ar_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autorole.enabled", "0")
+        await db.set_cfg(interaction.guild.id, "autorole.enabled", "0")
         await interaction.response.send_message("✅ Disabled.", ephemeral=True)
 
     @autorole.command(name="reset", description="Reset autorole.")
     async def ar_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         for k in ("autorole.roles", "autorole.enabled"):
-            await db.set_config(interaction.guild.id, k, None)
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= AUTONICK =================
@@ -1696,286 +1859,288 @@ def register_all_commands(bot: Freakos):
     tree.add_command(autonick)
 
     @autonick.command(name="setup", description="Set format and enable autonick.")
-    @app_commands.describe(format="Format, e.g. {user} | {server}")
     async def an_setup(interaction: discord.Interaction, format: str):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autonick.format", format)
-        await db.set_config(interaction.guild.id, "autonick.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "autonick.format", format)
+        await db.set_cfg(interaction.guild.id, "autonick.enabled", "1")
         await interaction.response.send_message("✅ Autonick enabled.", ephemeral=True)
 
     @autonick.command(name="format", description="Change autonick format.")
     async def an_format(interaction: discord.Interaction, format: str):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autonick.format", format)
+        await db.set_cfg(interaction.guild.id, "autonick.format", format)
         await interaction.response.send_message("✅ Format updated.", ephemeral=True)
 
     @autonick.command(name="enable", description="Enable autonick.")
     async def an_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autonick.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "autonick.enabled", "1")
         await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @autonick.command(name="disable", description="Disable autonick.")
     async def an_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autonick.enabled", "0")
+        await db.set_cfg(interaction.guild.id, "autonick.enabled", "0")
         await interaction.response.send_message("✅ Disabled.", ephemeral=True)
 
     @autonick.command(name="reset", description="Reset autonick.")
     async def an_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         for k in ("autonick.format", "autonick.enabled"):
-            await db.set_config(interaction.guild.id, k, None)
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= DEPARTURE =================
     departure = app_commands.Group(name="departure", description="Departure messages")
     tree.add_command(departure)
 
-    @departure.command(name="setup", description="Configure departure channel and enable.")
+    @departure.command(name="setup", description="Set channel and enable departure.")
     async def d_setup(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "departure.channel", channel.id)
-        await db.set_config(interaction.guild.id, "departure.enabled", "1")
-        await interaction.response.send_message(f"✅ Departure set to {channel.mention}.", ephemeral=True)
+        await db.set_cfg(interaction.guild.id, "departure.channel", channel.id)
+        await db.set_cfg(interaction.guild.id, "departure.enabled", "1")
+        await interaction.response.send_message(
+            f"✅ Departure set to {channel.mention}.", ephemeral=True)
 
     @departure.command(name="enable", description="Enable departure.")
     async def d_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "departure.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "departure.enabled", "1")
         await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @departure.command(name="disable", description="Disable departure.")
     async def d_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "departure.enabled", "0")
+        await db.set_cfg(interaction.guild.id, "departure.enabled", "0")
         await interaction.response.send_message("✅ Disabled.", ephemeral=True)
 
     @departure.command(name="channel", description="Set departure channel.")
     async def d_channel(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "departure.channel", channel.id)
+        await db.set_cfg(interaction.guild.id, "departure.channel", channel.id)
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
-    @departure.command(name="message", description="Set departure message.")
+    @departure.command(name="message",
+                       description="Set departure message (multiline supported).")
     async def d_message(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        current = await db.get_config(interaction.guild.id, "departure.message", "") or ""
+        cur = await db.get_cfg(interaction.guild.id, "departure.message", "") or ""
         await interaction.response.send_modal(TextModal(
-            title="Departure Message", default=current,
+            title="Departure Message", default=cur,
             on_submit=lambda i, v: _save_and_reply(i, "departure.message", v)))
 
     @departure.command(name="test", description="Send a test departure message.")
     async def d_test(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        ch_id = await db.get_config(interaction.guild.id, "departure.channel")
-        ch = interaction.guild.get_channel(int(ch_id)) if ch_id else None
-        if not ch:
-            return await interaction.response.send_message("No departure channel set.", ephemeral=True)
-        tpl = await db.get_config(interaction.guild.id, "departure.message") or \
-            "**{user}** left."
-        rendered = apply_placeholders(
-            tpl, user=interaction.user.name, mention=interaction.user.mention,
-            username=interaction.user.name, display_name=interaction.user.display_name,
-            server=interaction.guild.name, member_count=str(interaction.guild.member_count))
-        for c in chunk_message(rendered):
-            await ch.send(c)
+        if not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+        await send_departure(bot, interaction.user)
         await interaction.response.send_message("✅ Test sent.", ephemeral=True)
 
     @departure.command(name="reset", description="Reset departure.")
     async def d_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        for k in ("departure.channel", "departure.message", "departure.enabled"):
-            await db.set_config(interaction.guild.id, k, None)
+        for k in ("departure.channel", "departure.message",
+                  "departure.message_embed", "departure.enabled"):
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= ACTION DMS =================
-    actiondm = app_commands.Group(name="actiondm", description="Action DM messages")
+    actiondm = app_commands.Group(name="actiondm", description="Action DMs")
     tree.add_command(actiondm)
 
     @actiondm.command(name="setup", description="Enable action DMs.")
     async def a_setup(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "actiondm.enabled", "1")
-        await interaction.response.send_message("✅ Action DMs enabled.", ephemeral=True)
+        await db.set_cfg(interaction.guild.id, "actiondm.enabled", "1")
+        await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @actiondm.command(name="enable", description="Enable action DMs.")
     async def a_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "actiondm.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "actiondm.enabled", "1")
         await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @actiondm.command(name="disable", description="Disable action DMs.")
     async def a_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "actiondm.enabled", "0")
+        await db.set_cfg(interaction.guild.id, "actiondm.enabled", "0")
         await interaction.response.send_message("✅ Disabled.", ephemeral=True)
 
-    async def _edit_actiondm(interaction, key, title):
+    async def _edit_actiondm(interaction: discord.Interaction, key: str, title: str):
         if not await require_admin(interaction): return
-        current = await db.get_config(interaction.guild.id, key, "") or ""
+        cur = await db.get_cfg(interaction.guild.id, key, "") or ""
         await interaction.response.send_modal(TextModal(
-            title=title, default=current,
+            title=title, default=cur,
             on_submit=lambda i, v: _save_and_reply(i, key, v)))
 
-    @actiondm.command(name="timeout", description="Edit timeout DM.")
+    @actiondm.command(name="timeout", description="Edit the timeout DM.")
     async def a_timeout(interaction: discord.Interaction):
         await _edit_actiondm(interaction, "actiondm.timeout_msg", "Timeout DM")
 
-    @actiondm.command(name="timeout-end", description="Edit timeout-end DM.")
+    @actiondm.command(name="timeout-end", description="Edit the timeout-end DM.")
     async def a_timeout_end(interaction: discord.Interaction):
         await _edit_actiondm(interaction, "actiondm.timeout_end_msg", "Timeout-End DM")
 
-    @actiondm.command(name="kick", description="Edit kick DM.")
+    @actiondm.command(name="kick", description="Edit the kick DM.")
     async def a_kick(interaction: discord.Interaction):
         await _edit_actiondm(interaction, "actiondm.kick_msg", "Kick DM")
 
-    @actiondm.command(name="ban", description="Edit ban DM.")
+    @actiondm.command(name="ban", description="Edit the ban DM.")
     async def a_ban(interaction: discord.Interaction):
         await _edit_actiondm(interaction, "actiondm.ban_msg", "Ban DM")
 
-    @actiondm.command(name="test", description="Send a test DM to yourself.")
+    @actiondm.command(name="test", description="Send a test timeout DM to yourself.")
     async def a_test(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        msg = await db.get_config(interaction.guild.id, "actiondm.timeout_msg") or \
-            "You were timed out in {server} for {duration}. Reason: {reason}"
-        rendered = apply_placeholders(
-            msg, user=interaction.user.name, mention=interaction.user.mention,
-            username=interaction.user.name, display_name=interaction.user.display_name,
-            moderator=interaction.user.mention, reason="Test", duration="10m",
-            timeout_end=fmt_dt(now_utc()+timedelta(minutes=10)),
-            case_id="TEST", server=interaction.guild.name,
-            timestamp=fmt_dt(now_utc()))
+        tpl = await db.get_cfg(interaction.guild.id, "actiondm.timeout_msg") or \
+            "You were timed out in {server_name} for {duration}.\nReason: {reason}"
+        ph = build_user_placeholders(
+            interaction.user, interaction.guild,
+            moderator=interaction.user.mention,
+            reason="Test",
+            duration="10m",
+            timeout_end=fmt_dt(utcnow() + timedelta(minutes=10)),
+            case_id="TEST",
+        )
         try:
-            for c in chunk_message(rendered):
-                await interaction.user.send(c)
+            await safe_send(interaction.user, render(tpl, **ph))
             await interaction.response.send_message("✅ Sent via DM.", ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message("❌ Couldn't DM you.", ephemeral=True)
 
-    @actiondm.command(name="reset", description="Reset action DMs.")
+    @actiondm.command(name="reset", description="Reset all action DM templates.")
     async def a_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        for k in ("actiondm.enabled", "actiondm.timeout_msg", "actiondm.timeout_end_msg",
-                  "actiondm.kick_msg", "actiondm.ban_msg"):
-            await db.set_config(interaction.guild.id, k, None)
+        for k in ("actiondm.enabled", "actiondm.timeout_msg",
+                  "actiondm.timeout_end_msg", "actiondm.kick_msg", "actiondm.ban_msg"):
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= VC NOTIFICATIONS =================
     vcnotify = app_commands.Group(name="vcnotify", description="VC notifications")
     tree.add_command(vcnotify)
 
-    @vcnotify.command(name="setup", description="Set target text channel for a voice channel.")
+    @vcnotify.command(name="setup",
+                      description="Route a voice channel to a text channel.")
     async def v_setup(interaction: discord.Interaction,
                       voice_channel: discord.VoiceChannel,
                       text_channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        cfg = await db.get_json(interaction.guild.id, f"vcnotify.cfg.{voice_channel.id}", default={})
+        cfg = await db.get_json(interaction.guild.id,
+                                f"vcnotify.cfg.{voice_channel.id}", default={})
         cfg["target_channel_id"] = text_channel.id
         cfg["enabled"] = True
-        await db.set_json(interaction.guild.id, f"vcnotify.cfg.{voice_channel.id}", cfg)
-        watched = await db.get_json(interaction.guild.id, "vcnotify.channels", default=[])
-        if voice_channel.id not in watched:
-            watched.append(voice_channel.id)
-            await db.set_json(interaction.guild.id, "vcnotify.channels", watched)
+        await db.set_json(interaction.guild.id,
+                          f"vcnotify.cfg.{voice_channel.id}", cfg)
+        watch = await db.get_json(interaction.guild.id, "vcnotify.channels", default=[])
+        if voice_channel.id not in watch:
+            watch.append(voice_channel.id)
+            await db.set_json(interaction.guild.id, "vcnotify.channels", watch)
         await interaction.response.send_message(
             f"✅ {voice_channel.mention} → {text_channel.mention}.", ephemeral=True)
 
-    @vcnotify.command(name="enable", description="Enable VC notifications.")
+    @vcnotify.command(name="enable", description="Enable VC notifications globally.")
     async def v_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "vcnotify.enabled", "1")
         await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
-    @vcnotify.command(name="disable", description="Disable VC notifications.")
+    @vcnotify.command(name="disable", description="Disable VC notifications globally.")
     async def v_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "vcnotify.enabled", "0")
+        await db.set_cfg(interaction.guild.id, "vcnotify.enabled", "0")
         await interaction.response.send_message("✅ Disabled.", ephemeral=True)
 
     @vcnotify.command(name="add", description="Add a voice channel to watch.")
     async def v_add(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         if not await require_admin(interaction): return
-        watched = await db.get_json(interaction.guild.id, "vcnotify.channels", default=[])
-        if voice_channel.id not in watched:
-            watched.append(voice_channel.id)
-            await db.set_json(interaction.guild.id, "vcnotify.channels", watched)
+        watch = await db.get_json(interaction.guild.id, "vcnotify.channels", default=[])
+        if voice_channel.id not in watch:
+            watch.append(voice_channel.id)
+            await db.set_json(interaction.guild.id, "vcnotify.channels", watch)
         await interaction.response.send_message("✅ Added.", ephemeral=True)
 
     @vcnotify.command(name="remove", description="Remove a voice channel.")
     async def v_remove(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         if not await require_admin(interaction): return
-        watched = await db.get_json(interaction.guild.id, "vcnotify.channels", default=[])
-        watched = [c for c in watched if c != voice_channel.id]
-        await db.set_json(interaction.guild.id, "vcnotify.channels", watched)
+        watch = await db.get_json(interaction.guild.id, "vcnotify.channels", default=[])
+        watch = [c for c in watch if c != voice_channel.id]
+        await db.set_json(interaction.guild.id, "vcnotify.channels", watch)
         await interaction.response.send_message("✅ Removed.", ephemeral=True)
 
     @vcnotify.command(name="list", description="List watched voice channels.")
     async def v_list(interaction: discord.Interaction):
-        watched = await db.get_json(interaction.guild.id, "vcnotify.channels", default=[])
+        watch = await db.get_json(interaction.guild.id, "vcnotify.channels", default=[])
+        if not watch:
+            return await interaction.response.send_message("*(none)*", ephemeral=True)
         lines = []
-        for cid in watched:
-            cfg = await db.get_json(interaction.guild.id, f"vcnotify.cfg.{cid}", default={})
+        for cid in watch:
+            cfg = await db.get_json(interaction.guild.id,
+                                    f"vcnotify.cfg.{cid}", default={})
             tgt = cfg.get("target_channel_id")
             lines.append(f"• <#{cid}> → <#{tgt}>" if tgt else f"• <#{cid}> (no target)")
-        await interaction.response.send_message("\n".join(lines) or "*(none)*", ephemeral=True)
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    async def _edit_vc_msg(interaction, vc: discord.VoiceChannel, key, title):
+    async def _edit_vc_msg(interaction: discord.Interaction,
+                           vc: discord.VoiceChannel, key: str, title: str):
         if not await require_admin(interaction): return
-        cfg = await db.get_json(interaction.guild.id, f"vcnotify.cfg.{vc.id}", default={})
-        current = cfg.get(key) or ""
-        async def save(i, v):
+        cfg = await db.get_json(interaction.guild.id,
+                                f"vcnotify.cfg.{vc.id}", default={})
+        cur = cfg.get(key) or ""
+
+        async def save(i: discord.Interaction, v: str):
             cfg2 = await db.get_json(i.guild.id, f"vcnotify.cfg.{vc.id}", default={})
             cfg2[key] = v
             await db.set_json(i.guild.id, f"vcnotify.cfg.{vc.id}", cfg2)
             await i.response.send_message("✅ Saved.", ephemeral=True)
-        await interaction.response.send_modal(TextModal(title=title, default=current, on_submit=save))
 
-    @vcnotify.command(name="join-message", description="Set join message.")
+        await interaction.response.send_modal(
+            TextModal(title=title, default=cur, on_submit=save))
+
+    @vcnotify.command(name="join-message", description="Set the join message for a VC.")
     async def v_join(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         await _edit_vc_msg(interaction, voice_channel, "join_msg", "VC Join Message")
 
-    @vcnotify.command(name="leave-message", description="Set leave message.")
+    @vcnotify.command(name="leave-message", description="Set the leave message for a VC.")
     async def v_leave(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         await _edit_vc_msg(interaction, voice_channel, "leave_msg", "VC Leave Message")
 
-    @vcnotify.command(name="test", description="Test VC message.")
+    @vcnotify.command(name="test", description="Send a test VC message.")
     async def v_test(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         if not await require_admin(interaction): return
-        cfg = await db.get_json(interaction.guild.id, f"vcnotify.cfg.{voice_channel.id}", default={})
-        tgt = interaction.guild.get_channel(cfg.get("target_channel_id") or 0)
-        if not tgt:
+        cfg = await db.get_json(interaction.guild.id,
+                                f"vcnotify.cfg.{voice_channel.id}", default={})
+        target = interaction.guild.get_channel(cfg.get("target_channel_id") or 0)
+        if not isinstance(target, discord.TextChannel):
             return await interaction.response.send_message("No target set.", ephemeral=True)
         tpl = cfg.get("join_msg") or "🎧 {mention} joined **{channel_name}**."
-        rendered = apply_placeholders(
-            tpl, mention=interaction.user.mention, user=interaction.user.name,
-            username=interaction.user.name, display_name=interaction.user.display_name,
-            channel_name=voice_channel.name, server=interaction.guild.name)
-        for c in chunk_message(rendered):
-            await tgt.send(c)
+        ph = build_user_placeholders(interaction.user, interaction.guild,
+                                     channel_name=voice_channel.name)
+        await safe_send(target, render(tpl, **ph))
         await interaction.response.send_message("✅ Sent.", ephemeral=True)
 
-    @vcnotify.command(name="reset", description="Reset VC notifications.")
+    @vcnotify.command(name="reset", description="Reset all VC notification config.")
     async def v_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "vcnotify.channels", None)
-        await db.set_config(interaction.guild.id, "vcnotify.enabled", None)
         rows = await db.fetchall(
             "SELECT key FROM guild_config WHERE guild_id=? AND key LIKE 'vcnotify.cfg.%'",
             (interaction.guild.id,))
         for r in rows:
-            await db.set_config(interaction.guild.id, r["key"], None)
+            await db.set_cfg(interaction.guild.id, r["key"], None)
+        for k in ("vcnotify.channels", "vcnotify.enabled"):
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= TICKETS =================
     ticket = app_commands.Group(name="ticket", description="Ticket system")
     tree.add_command(ticket)
 
-    @ticket.command(name="setup", description="Initial ticket setup.")
+    @ticket.command(name="setup", description="Show ticket setup guidance.")
     async def t_setup(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await interaction.response.send_message(
-            "Use `/ticket type` to add a ticket type, then `/ticket panel` to place the panel.",
+            "Use `/ticket type` to add a ticket type, then `/ticket panel`.",
             ephemeral=True)
 
     @ticket.command(name="panel", description="Post the ticket panel.")
@@ -1985,57 +2150,63 @@ def register_all_commands(bot: Freakos):
                       description: Optional[str] = None):
         if not await require_admin(interaction): return
         ch = channel or interaction.channel
-        embed = make_embed(title=title or "🎫 Support Tickets",
-                           description=description or "Click the button below to open a ticket.")
+        embed = make_embed(
+            title=title or "🎫 Support Tickets",
+            description=description or "Click the button below to open a ticket.",
+        )
         await ch.send(embed=embed, view=TicketCreateButton())
-        await interaction.response.send_message(f"✅ Panel posted in {ch.mention}.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Panel posted in {ch.mention}.", ephemeral=True)
 
     @ticket.command(name="type", description="Add or update a ticket type.")
-    @app_commands.describe(name="Name", category="Category", support_role="Support role",
-                           emoji="Optional emoji", message="Intro message (optional)")
-    async def t_type(interaction: discord.Interaction, name: str,
+    async def t_type(interaction: discord.Interaction,
+                     name: str,
                      category: discord.CategoryChannel,
                      support_role: discord.Role,
                      emoji: Optional[str] = None,
                      message: Optional[str] = None):
         if not await require_admin(interaction): return
         await db.execute(
-            "INSERT INTO ticket_types (guild_id, name, emoji, category_id, support_role_id, message) "
+            "INSERT INTO ticket_types "
+            "(guild_id, name, emoji, category_id, support_role_id, message) "
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(guild_id, name) DO UPDATE SET "
             "emoji=excluded.emoji, category_id=excluded.category_id, "
             "support_role_id=excluded.support_role_id, message=excluded.message",
             (interaction.guild.id, name, emoji, category.id, support_role.id, message))
-        await interaction.response.send_message(f"✅ Ticket type `{name}` saved.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Ticket type `{name}` saved.", ephemeral=True)
 
     @ticket.command(name="category", description="Update a type's category.")
     async def t_category(interaction: discord.Interaction, name: str,
                          category: discord.CategoryChannel):
         if not await require_admin(interaction): return
-        await db.execute("UPDATE ticket_types SET category_id=? WHERE guild_id=? AND name=?",
-                         (category.id, interaction.guild.id, name))
+        await db.execute(
+            "UPDATE ticket_types SET category_id=? WHERE guild_id=? AND name=?",
+            (category.id, interaction.guild.id, name))
         await interaction.response.send_message("✅ Updated.", ephemeral=True)
 
     @ticket.command(name="support-role", description="Update a type's support role.")
     async def t_support(interaction: discord.Interaction, name: str, role: discord.Role):
         if not await require_admin(interaction): return
-        await db.execute("UPDATE ticket_types SET support_role_id=? WHERE guild_id=? AND name=?",
-                         (role.id, interaction.guild.id, name))
+        await db.execute(
+            "UPDATE ticket_types SET support_role_id=? WHERE guild_id=? AND name=?",
+            (role.id, interaction.guild.id, name))
         await interaction.response.send_message("✅ Updated.", ephemeral=True)
 
     @ticket.command(name="limit", description="Max open tickets per user.")
     async def t_limit(interaction: discord.Interaction, limit: int):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "ticket.limit", str(limit))
+        await db.set_cfg(interaction.guild.id, "ticket.limit", str(max(0, limit)))
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
     @ticket.command(name="cooldown", description="Cooldown between tickets (seconds).")
     async def t_cooldown(interaction: discord.Interaction, seconds: int):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "ticket.cooldown", str(seconds))
+        await db.set_cfg(interaction.guild.id, "ticket.cooldown", str(max(0, seconds)))
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
-    @ticket.command(name="claim", description="Claim current ticket.")
+    @ticket.command(name="claim", description="Claim the current ticket.")
     async def t_claim(interaction: discord.Interaction):
         row = await db.fetchone("SELECT * FROM tickets WHERE channel_id=?",
                                 (interaction.channel.id,))
@@ -2045,9 +2216,10 @@ def register_all_commands(bot: Freakos):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
         await db.execute("UPDATE tickets SET claimed_by=? WHERE id=?",
                          (interaction.user.id, row["id"]))
-        await interaction.response.send_message(f"✅ Claimed by {interaction.user.mention}")
+        await interaction.response.send_message(
+            f"✅ Claimed by {interaction.user.mention}")
 
-    @ticket.command(name="close", description="Close current ticket.")
+    @ticket.command(name="close", description="Close the current ticket.")
     async def t_close(interaction: discord.Interaction):
         row = await db.fetchone("SELECT * FROM tickets WHERE channel_id=?",
                                 (interaction.channel.id,))
@@ -2059,12 +2231,13 @@ def register_all_commands(bot: Freakos):
         try:
             ow = interaction.channel.overwrites_for(interaction.guild.default_role)
             ow.send_messages = False
-            await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
+            await interaction.channel.set_permissions(
+                interaction.guild.default_role, overwrite=ow)
         except Exception:
             pass
         await interaction.response.send_message("🔒 Ticket closed.")
 
-    @ticket.command(name="reopen", description="Reopen current ticket.")
+    @ticket.command(name="reopen", description="Reopen the current ticket.")
     async def t_reopen(interaction: discord.Interaction):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
@@ -2076,12 +2249,13 @@ def register_all_commands(bot: Freakos):
         try:
             ow = interaction.channel.overwrites_for(interaction.guild.default_role)
             ow.send_messages = None
-            await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
+            await interaction.channel.set_permissions(
+                interaction.guild.default_role, overwrite=ow)
         except Exception:
             pass
         await interaction.response.send_message("🔓 Reopened.")
 
-    @ticket.command(name="delete", description="Delete current ticket channel.")
+    @ticket.command(name="delete", description="Delete the current ticket channel.")
     async def t_delete(interaction: discord.Interaction):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
@@ -2097,7 +2271,7 @@ def register_all_commands(bot: Freakos):
         except Exception:
             pass
 
-    @ticket.command(name="rename", description="Rename current ticket.")
+    @ticket.command(name="rename", description="Rename the current ticket channel.")
     async def t_rename(interaction: discord.Interaction, name: str):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
@@ -2111,34 +2285,44 @@ def register_all_commands(bot: Freakos):
     async def t_add(interaction: discord.Interaction, member: discord.Member):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
-        await interaction.channel.set_permissions(
-            member, view_channel=True, send_messages=True, read_message_history=True)
+        try:
+            await interaction.channel.set_permissions(
+                member, view_channel=True, send_messages=True,
+                read_message_history=True)
+        except Exception as e:
+            return await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
         await interaction.response.send_message(f"✅ Added {member.mention}.")
 
     @ticket.command(name="remove", description="Remove a user from the ticket.")
     async def t_remove(interaction: discord.Interaction, member: discord.Member):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("Staff only.", ephemeral=True)
-        await interaction.channel.set_permissions(member, overwrite=None)
+        try:
+            await interaction.channel.set_permissions(member, overwrite=None)
+        except Exception as e:
+            return await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
         await interaction.response.send_message(f"✅ Removed {member.mention}.")
 
-    @ticket.command(name="transcript", description="Generate a transcript.")
+    @ticket.command(name="transcript", description="Generate a transcript file.")
     async def t_transcript(interaction: discord.Interaction):
-        messages = []
-        async for m in interaction.channel.history(limit=500, oldest_first=True):
-            messages.append(f"[{fmt_dt(m.created_at)}] {m.author}: {m.content}")
-        text = "\n".join(messages) or "(empty)"
-        import io
+        await interaction.response.defer(ephemeral=True)
+        lines = []
+        async for m in interaction.channel.history(limit=1000, oldest_first=True):
+            lines.append(f"[{fmt_dt(m.created_at)}] {m.author}: {m.content}")
+        text = "\n".join(lines) or "(empty)"
         buf = io.BytesIO(text.encode("utf-8"))
-        await interaction.response.send_message(
-            "📄 Transcript:", file=discord.File(buf, filename=f"transcript-{interaction.channel.id}.txt"))
+        await interaction.followup.send(
+            "📄 Transcript:",
+            file=discord.File(buf, filename=f"transcript-{interaction.channel.id}.txt"),
+            ephemeral=True)
 
     @ticket.command(name="reset", description="Reset all ticket config.")
     async def t_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.execute("DELETE FROM ticket_types WHERE guild_id=?", (interaction.guild.id,))
+        await db.execute("DELETE FROM ticket_types WHERE guild_id=?",
+                         (interaction.guild.id,))
         for k in ("ticket.limit", "ticket.cooldown"):
-            await db.set_config(interaction.guild.id, k, None)
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= VOUCHES =================
@@ -2148,14 +2332,13 @@ def register_all_commands(bot: Freakos):
     @vouch.command(name="setup", description="Set the vouch channel.")
     async def vo_setup(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "vouch.channel", channel.id)
+        await db.set_cfg(interaction.guild.id, "vouch.channel", channel.id)
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
-    @vouch.command(name="panel", description="Post a vouch panel.")
+    @vouch.command(name="panel", description="Show how to use vouches.")
     async def vo_panel(interaction: discord.Interaction):
-        if not await require_admin(interaction): return
         await interaction.response.send_message(
-            "Users can create vouches with `/vouch add @user <comment>`.",
+            "Users can vouch with `/vouch add user:@user comment:...`.",
             ephemeral=True)
 
     @vouch.command(name="add", description="Vouch for a user.")
@@ -2164,13 +2347,13 @@ def register_all_commands(bot: Freakos):
         await db.execute(
             "INSERT INTO vouches (guild_id, user_id, voucher_id, comment, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (interaction.guild.id, user.id, interaction.user.id, comment, iso(now_utc())))
-        ch_id = await db.get_config(interaction.guild.id, "vouch.channel")
+            (interaction.guild.id, user.id, interaction.user.id, comment,
+             to_iso(utcnow())))
+        ch_id = await db.get_cfg(interaction.guild.id, "vouch.channel")
         if ch_id:
             ch = interaction.guild.get_channel(int(ch_id))
-            if ch:
-                e = make_embed(title="⭐ New Vouch",
-                               description=comment)
+            if isinstance(ch, discord.TextChannel):
+                e = make_embed(title="⭐ New Vouch", description=comment)
                 e.add_field(name="User", value=user.mention, inline=True)
                 e.add_field(name="From", value=interaction.user.mention, inline=True)
                 try:
@@ -2193,24 +2376,26 @@ def register_all_commands(bot: Freakos):
     @vouch.command(name="user", description="Show a user's vouches.")
     async def vo_user(interaction: discord.Interaction, user: discord.Member):
         rows = await db.fetchall(
-            "SELECT * FROM vouches WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 20",
+            "SELECT * FROM vouches WHERE guild_id=? AND user_id=? "
+            "ORDER BY id DESC LIMIT 20",
             (interaction.guild.id, user.id))
         if not rows:
             return await interaction.response.send_message("No vouches.", ephemeral=True)
-        lines = [f"• {r['comment'][:80]} — <@{r['voucher_id']}> ({fmt_dt(parse_iso(r['created_at']))})"
-                 for r in rows]
+        lines = [f"• {r['comment'][:80]} — <@{r['voucher_id']}> "
+                 f"({fmt_dt(from_iso(r['created_at']))})" for r in rows]
         e = make_embed(title=f"Vouches for {user}", description="\n".join(lines))
         await interaction.response.send_message(embed=e, ephemeral=True)
 
     @vouch.command(name="stats", description="Vouch leaderboard.")
     async def vo_stats(interaction: discord.Interaction):
         rows = await db.fetchall(
-            "SELECT user_id, COUNT(*) c FROM vouches WHERE guild_id=? GROUP BY user_id "
-            "ORDER BY c DESC LIMIT 10",
+            "SELECT user_id, COUNT(*) c FROM vouches WHERE guild_id=? "
+            "GROUP BY user_id ORDER BY c DESC LIMIT 10",
             (interaction.guild.id,))
         if not rows:
             return await interaction.response.send_message("No vouches yet.", ephemeral=True)
-        lines = [f"`#{i+1}` <@{r['user_id']}> — **{r['c']}**" for i, r in enumerate(rows)]
+        lines = [f"`#{i+1}` <@{r['user_id']}> — **{r['c']}**"
+                 for i, r in enumerate(rows)]
         e = make_embed(title="⭐ Vouch Leaderboard", description="\n".join(lines))
         await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -2218,7 +2403,7 @@ def register_all_commands(bot: Freakos):
     async def vo_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.execute("DELETE FROM vouches WHERE guild_id=?", (interaction.guild.id,))
-        await db.set_config(interaction.guild.id, "vouch.channel", None)
+        await db.set_cfg(interaction.guild.id, "vouch.channel", None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= SHOP =================
@@ -2228,8 +2413,9 @@ def register_all_commands(bot: Freakos):
     @shop.command(name="setup", description="Post the shop panel.")
     async def sh_setup(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await channel.send(embed=make_embed(
-            title="🛒 Shop", description="Browse products and place orders using the buttons below."),
+        await channel.send(
+            embed=make_embed(title="🛒 Shop",
+                             description="Browse products and buy using the buttons below."),
             view=ShopPanelView())
         await interaction.response.send_message("✅ Panel posted.", ephemeral=True)
 
@@ -2239,10 +2425,12 @@ def register_all_commands(bot: Freakos):
                      stock: int = -1, image: Optional[str] = None):
         if not await require_admin(interaction): return
         pid = await db.execute(
-            "INSERT INTO shop_products (guild_id, name, description, price, stock, active, image) "
+            "INSERT INTO shop_products "
+            "(guild_id, name, description, price, stock, active, image) "
             "VALUES (?, ?, ?, ?, ?, 1, ?)",
             (interaction.guild.id, name, description, price, stock, image))
-        await interaction.response.send_message(f"✅ Added product `#{pid}`.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Added product `#{pid}`.", ephemeral=True)
 
     @shop.command(name="remove", description="Remove a product.")
     async def sh_remove(interaction: discord.Interaction, product_id: int):
@@ -2254,12 +2442,15 @@ def register_all_commands(bot: Freakos):
     @shop.command(name="edit", description="Edit a product.")
     async def sh_edit(interaction: discord.Interaction, product_id: int,
                       name: Optional[str] = None, price: Optional[float] = None,
-                      description: Optional[str] = None, stock: Optional[int] = None,
-                      active: Optional[bool] = None, image: Optional[str] = None):
+                      description: Optional[str] = None,
+                      stock: Optional[int] = None,
+                      active: Optional[bool] = None,
+                      image: Optional[str] = None):
         if not await require_admin(interaction): return
         updates, params = [], []
-        for col, val in (("name", name), ("price", price), ("description", description),
-                         ("stock", stock), ("image", image)):
+        for col, val in (("name", name), ("price", price),
+                         ("description", description), ("stock", stock),
+                         ("image", image)):
             if val is not None:
                 updates.append(f"{col}=?")
                 params.append(val)
@@ -2284,50 +2475,57 @@ def register_all_commands(bot: Freakos):
         for r in rows:
             stock = "∞" if r["stock"] < 0 else r["stock"]
             flag = "✅" if r["active"] else "❌"
-            lines.append(f"{flag} `#{r['id']}` **{r['name']}** — {r['price']} (stock {stock})")
+            lines.append(f"{flag} `#{r['id']}` **{r['name']}** — "
+                         f"{r['price']} (stock {stock})")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    @shop.command(name="buy", description="Buy a product (creates order).")
-    async def sh_buy(interaction: discord.Interaction, product_id: int, quantity: int = 1):
+    @shop.command(name="buy", description="Buy a product (creates an order).")
+    async def sh_buy(interaction: discord.Interaction,
+                     product_id: int, quantity: int = 1):
         p = await db.fetchone(
             "SELECT * FROM shop_products WHERE id=? AND guild_id=?",
             (product_id, interaction.guild.id))
         if not p or not p["active"]:
             return await interaction.response.send_message("Not available.", ephemeral=True)
+        quantity = max(1, quantity)
         if p["stock"] >= 0 and p["stock"] < quantity:
             return await interaction.response.send_message("Not enough stock.", ephemeral=True)
-        total = p["price"] * quantity
+        total = float(p["price"]) * quantity
         oid = await db.execute(
-            "INSERT INTO orders (guild_id, user_id, product_id, quantity, price, status, created_at, updated_at) "
+            "INSERT INTO orders (guild_id, user_id, product_id, quantity, price, "
+            "status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
             (interaction.guild.id, interaction.user.id, product_id, quantity, total,
-             iso(now_utc()), iso(now_utc())))
+             to_iso(utcnow()), to_iso(utcnow())))
         if p["stock"] >= 0:
             await db.execute("UPDATE shop_products SET stock=stock-? WHERE id=?",
                              (quantity, product_id))
         await interaction.response.send_message(
             f"✅ Order `#{oid}` created. Total: {total}.", ephemeral=True)
 
-    @shop.command(name="stock", description="Check stock.")
+    @shop.command(name="stock", description="Check a product's stock.")
     async def sh_stock(interaction: discord.Interaction, product_id: int):
-        p = await db.fetchone("SELECT * FROM shop_products WHERE id=? AND guild_id=?",
-                              (product_id, interaction.guild.id))
+        p = await db.fetchone(
+            "SELECT * FROM shop_products WHERE id=? AND guild_id=?",
+            (product_id, interaction.guild.id))
         if not p:
             return await interaction.response.send_message("Not found.", ephemeral=True)
         stock = "∞" if p["stock"] < 0 else p["stock"]
         await interaction.response.send_message(f"Stock: **{stock}**", ephemeral=True)
 
-    @shop.command(name="panel", description="Post shop panel.")
+    @shop.command(name="panel", description="Post the shop panel in a channel.")
     async def sh_panel(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await channel.send(embed=make_embed(title="🛒 Shop", description="Browse products."),
-                           view=ShopPanelView())
+        await channel.send(
+            embed=make_embed(title="🛒 Shop", description="Browse products."),
+            view=ShopPanelView())
         await interaction.response.send_message("✅ Panel posted.", ephemeral=True)
 
-    @shop.command(name="reset", description="Reset shop.")
+    @shop.command(name="reset", description="Reset all products.")
     async def sh_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.execute("DELETE FROM shop_products WHERE guild_id=?", (interaction.guild.id,))
+        await db.execute("DELETE FROM shop_products WHERE guild_id=?",
+                         (interaction.guild.id,))
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= ORDERS =================
@@ -2335,10 +2533,11 @@ def register_all_commands(bot: Freakos):
     tree.add_command(order)
 
     @order.command(name="create", description="Create an order.")
-    async def o_create(interaction: discord.Interaction, product_id: int, quantity: int = 1):
-        await sh_buy.callback(interaction, product_id, quantity)  # reuse
+    async def o_create(interaction: discord.Interaction,
+                       product_id: int, quantity: int = 1):
+        await sh_buy.callback(interaction, product_id, quantity)
 
-    @order.command(name="list", description="List orders.")
+    @order.command(name="list", description="List recent orders.")
     async def o_list(interaction: discord.Interaction):
         rows = await db.fetchall(
             "SELECT * FROM orders WHERE guild_id=? ORDER BY id DESC LIMIT 25",
@@ -2361,17 +2560,18 @@ def register_all_commands(bot: Freakos):
         e.add_field(name="Quantity", value=str(r["quantity"]))
         e.add_field(name="Total", value=str(r["price"]))
         e.add_field(name="Status", value=r["status"])
-        e.add_field(name="Created", value=fmt_dt(parse_iso(r["created_at"])))
+        e.add_field(name="Created", value=fmt_dt(from_iso(r["created_at"])))
         await interaction.response.send_message(embed=e, ephemeral=True)
 
-    @order.command(name="status", description="Set order status.")
+    @order.command(name="status", description="Set an order's status.")
     async def o_status(interaction: discord.Interaction, order_id: int, status: str):
         if not await require_admin(interaction): return
-        await db.execute("UPDATE orders SET status=?, updated_at=? WHERE id=? AND guild_id=?",
-                         (status, iso(now_utc()), order_id, interaction.guild.id))
+        await db.execute(
+            "UPDATE orders SET status=?, updated_at=? WHERE id=? AND guild_id=?",
+            (status, to_iso(utcnow()), order_id, interaction.guild.id))
         await interaction.response.send_message("✅ Updated.", ephemeral=True)
 
-    @order.command(name="cancel", description="Cancel order.")
+    @order.command(name="cancel", description="Cancel an order.")
     async def o_cancel(interaction: discord.Interaction, order_id: int):
         r = await db.fetchone("SELECT * FROM orders WHERE id=? AND guild_id=?",
                               (order_id, interaction.guild.id))
@@ -2379,28 +2579,31 @@ def register_all_commands(bot: Freakos):
             return await interaction.response.send_message("Not found.", ephemeral=True)
         if r["user_id"] != interaction.user.id and not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("Not allowed.", ephemeral=True)
-        await db.execute("UPDATE orders SET status='cancelled', updated_at=? WHERE id=?",
-                         (iso(now_utc()), order_id))
+        await db.execute(
+            "UPDATE orders SET status='cancelled', updated_at=? WHERE id=?",
+            (to_iso(utcnow()), order_id))
         await interaction.response.send_message("✅ Cancelled.", ephemeral=True)
 
-    @order.command(name="complete", description="Mark order complete.")
+    @order.command(name="complete", description="Mark an order as complete.")
     async def o_complete(interaction: discord.Interaction, order_id: int):
         if not await require_admin(interaction): return
-        await db.execute("UPDATE orders SET status='completed', updated_at=? WHERE id=? AND guild_id=?",
-                         (iso(now_utc()), order_id, interaction.guild.id))
+        await db.execute(
+            "UPDATE orders SET status='completed', updated_at=? "
+            "WHERE id=? AND guild_id=?",
+            (to_iso(utcnow()), order_id, interaction.guild.id))
         await interaction.response.send_message("✅ Completed.", ephemeral=True)
 
     # ================= NOTIFICATIONS =================
-    notify = app_commands.Group(name="notify", description="Notification channel")
+    notify = app_commands.Group(name="notify", description="Notification system")
     tree.add_command(notify)
 
-    @notify.command(name="setup", description="Set notify channel.")
+    @notify.command(name="setup", description="Set the notify channel.")
     async def n_setup(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "notify.channel", channel.id)
+        await db.set_cfg(interaction.guild.id, "notify.channel", channel.id)
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
-    @notify.command(name="add", description="Add a notify message preset.")
+    @notify.command(name="add", description="Add a notify preset.")
     async def n_add(interaction: discord.Interaction, name: str, message: str):
         if not await require_admin(interaction): return
         msgs = await db.get_json(interaction.guild.id, "notify.messages", default={})
@@ -2425,27 +2628,23 @@ def register_all_commands(bot: Freakos):
     @notify.command(name="test", description="Send a test notification.")
     async def n_test(interaction: discord.Interaction, name: str):
         if not await require_admin(interaction): return
-        ch_id = await db.get_config(interaction.guild.id, "notify.channel")
+        ch_id = await db.get_cfg(interaction.guild.id, "notify.channel")
         ch = interaction.guild.get_channel(int(ch_id)) if ch_id else None
-        if not ch:
+        if not isinstance(ch, discord.TextChannel):
             return await interaction.response.send_message("No channel.", ephemeral=True)
         msgs = await db.get_json(interaction.guild.id, "notify.messages", default={})
         tpl = msgs.get(name)
         if not tpl:
             return await interaction.response.send_message("No such preset.", ephemeral=True)
-        rendered = apply_placeholders(tpl, user=interaction.user.name,
-                                      mention=interaction.user.mention,
-                                      server=interaction.guild.name,
-                                      timestamp=fmt_dt(now_utc()))
-        for c in chunk_message(rendered):
-            await ch.send(c)
+        ph = build_user_placeholders(interaction.user, interaction.guild)
+        await safe_send(ch, render(tpl, **ph))
         await interaction.response.send_message("✅ Sent.", ephemeral=True)
 
-    @notify.command(name="reset", description="Reset notifications.")
+    @notify.command(name="reset", description="Reset notify config.")
     async def n_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         for k in ("notify.channel", "notify.messages"):
-            await db.set_config(interaction.guild.id, k, None)
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= AUTOMOD =================
@@ -2455,22 +2654,22 @@ def register_all_commands(bot: Freakos):
     @automod.command(name="setup", description="Enable automod.")
     async def am_setup(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "automod.enabled", "1")
-        await interaction.response.send_message("✅ Automod enabled.", ephemeral=True)
+        await db.set_cfg(interaction.guild.id, "automod.enabled", "1")
+        await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @automod.command(name="enable", description="Enable automod.")
     async def am_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "automod.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "automod.enabled", "1")
         await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @automod.command(name="disable", description="Disable automod.")
     async def am_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "automod.enabled", "0")
+        await db.set_cfg(interaction.guild.id, "automod.enabled", "0")
         await interaction.response.send_message("✅ Disabled.", ephemeral=True)
 
-    async def _set_setting(interaction, key, value):
+    async def _am_setting(interaction: discord.Interaction, key: str, value: Any):
         if not await require_admin(interaction): return
         s = await db.get_json(interaction.guild.id, "automod.settings", default={})
         s[key] = value
@@ -2479,30 +2678,32 @@ def register_all_commands(bot: Freakos):
 
     @automod.command(name="antispam", description="Toggle anti-spam.")
     async def am_spam(interaction: discord.Interaction, enabled: bool):
-        await _set_setting(interaction, "antispam", enabled)
+        await _am_setting(interaction, "antispam", enabled)
 
     @automod.command(name="links", description="Toggle link filtering.")
     async def am_links(interaction: discord.Interaction, enabled: bool):
-        await _set_setting(interaction, "links", enabled)
+        await _am_setting(interaction, "links", enabled)
 
     @automod.command(name="mentions", description="Toggle mention-spam filter.")
     async def am_mentions(interaction: discord.Interaction, enabled: bool):
-        await _set_setting(interaction, "mentions", enabled)
+        await _am_setting(interaction, "mentions", enabled)
 
-    @automod.command(name="invites", description="Toggle invite filter.")
+    @automod.command(name="invites", description="Toggle invite filtering.")
     async def am_invites(interaction: discord.Interaction, enabled: bool):
-        await _set_setting(interaction, "invites", enabled)
+        await _am_setting(interaction, "invites", enabled)
 
     @automod.command(name="words", description="Set banned words (comma-separated).")
     async def am_words(interaction: discord.Interaction, words: str):
-        await _set_setting(interaction, "words", [w.strip() for w in words.split(",") if w.strip()])
+        await _am_setting(interaction, "words",
+                          [w.strip() for w in words.split(",") if w.strip()])
 
-    @automod.command(name="actions", description="Set action (delete/warn/timeout/kick/ban).")
+    @automod.command(name="actions",
+                     description="Set action: delete | warn | timeout | kick | ban")
     async def am_actions(interaction: discord.Interaction, action: str):
         action = action.lower()
         if action not in ("delete", "warn", "timeout", "kick", "ban"):
             return await interaction.response.send_message("Invalid action.", ephemeral=True)
-        await _set_setting(interaction, "action", action)
+        await _am_setting(interaction, "action", action)
 
     @automod.command(name="whitelist", description="Whitelist a channel or role.")
     async def am_whitelist(interaction: discord.Interaction,
@@ -2523,51 +2724,54 @@ def register_all_commands(bot: Freakos):
     async def am_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         for k in ("automod.enabled", "automod.settings", "automod.whitelist"):
-            await db.set_config(interaction.guild.id, k, None)
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= MODERATION =================
     async def _create_case(guild_id: int, user_id: int, mod_id: int,
                            action: str, reason: str) -> int:
         return await db.execute(
-            "INSERT INTO cases (guild_id, user_id, moderator_id, action, reason, created_at) "
+            "INSERT INTO cases "
+            "(guild_id, user_id, moderator_id, action, reason, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (guild_id, user_id, mod_id, action, reason, iso(now_utc())))
+            (guild_id, user_id, mod_id, action, reason, to_iso(utcnow())))
 
     async def _try_action_dm(guild: discord.Guild, member: discord.Member,
                              template_key: str, **extra):
-        if await db.get_config(guild.id, "actiondm.enabled", "0") != "1":
+        if await db.get_cfg(guild.id, "actiondm.enabled", "0") != "1":
             return
-        msg = await db.get_config(guild.id, template_key)
-        if not msg:
+        tpl = await db.get_cfg(guild.id, template_key)
+        if not tpl:
             return
-        rendered = apply_placeholders(
-            msg, user=member.name, mention=member.mention,
-            username=member.name, display_name=member.display_name,
-            server=guild.name, timestamp=fmt_dt(now_utc()), **extra)
+        ph = build_user_placeholders(member, guild, **extra)
         try:
-            for c in chunk_message(rendered):
-                await member.send(c)
+            await safe_send(member, render(tpl, **ph))
         except Exception:
-            pass
+            pass  # DM failures never abort moderation
 
     @tree.command(name="warn", description="Warn a member.")
     @app_commands.default_permissions(moderate_members=True)
-    async def warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
+    async def warn(interaction: discord.Interaction,
+                   member: discord.Member, reason: str = "No reason"):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         ok, why = hierarchy_ok(interaction.guild, member)
         if not ok:
             return await interaction.response.send_message(f"❌ {why}", ephemeral=True)
         wid = await db.execute(
-            "INSERT INTO warnings (guild_id, user_id, moderator_id, reason, created_at) "
+            "INSERT INTO warnings "
+            "(guild_id, user_id, moderator_id, reason, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (interaction.guild.id, member.id, interaction.user.id, reason, iso(now_utc())))
-        await _create_case(interaction.guild.id, member.id, interaction.user.id, "warn", reason)
+            (interaction.guild.id, member.id, interaction.user.id, reason,
+             to_iso(utcnow())))
+        cid = await _create_case(interaction.guild.id, member.id,
+                                 interaction.user.id, "warn", reason)
         await interaction.response.send_message(
-            f"⚠️ Warned {member.mention} (warning #{wid}): {reason}")
-        await _log_guild(bot, interaction.guild, "warnings", "Member Warned",
-                         f"**Member:** {member.mention}\n**By:** {interaction.user.mention}\n**Reason:** {reason}")
+            f"⚠️ Warned {member.mention} (warning #{wid}, case #{cid}): {reason}")
+        await log_guild(bot, interaction.guild, "warnings", "Member Warned",
+                        f"**Member:** {member.mention}\n"
+                        f"**By:** {interaction.user.mention}\n"
+                        f"**Reason:** {reason}")
 
     @tree.command(name="warnings", description="List warnings for a member.")
     async def warnings(interaction: discord.Interaction, member: discord.Member):
@@ -2576,8 +2780,9 @@ def register_all_commands(bot: Freakos):
             (interaction.guild.id, member.id))
         if not rows:
             return await interaction.response.send_message("No warnings.", ephemeral=True)
-        lines = [f"`#{r['id']}` by <@{r['moderator_id']}> — {r['reason']}" for r in rows]
-        await interaction.response.send_message("\n".join(lines[:25]), ephemeral=True)
+        lines = [f"`#{r['id']}` by <@{r['moderator_id']}> — {r['reason']}"
+                 for r in rows[:25]]
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @tree.command(name="clearwarnings", description="Clear warnings for a member.")
     async def clearwarnings(interaction: discord.Interaction, member: discord.Member):
@@ -2589,30 +2794,40 @@ def register_all_commands(bot: Freakos):
 
     @tree.command(name="timeout", description="Timeout a member.")
     @app_commands.default_permissions(moderate_members=True)
-    async def timeout_cmd(interaction: discord.Interaction, member: discord.Member,
+    async def timeout_cmd(interaction: discord.Interaction,
+                          member: discord.Member,
                           duration: str, reason: str = "No reason"):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         ok, why = hierarchy_ok(interaction.guild, member)
         if not ok:
             return await interaction.response.send_message(f"❌ {why}", ephemeral=True)
-        secs = parse_duration(duration)
+        secs = parse_dur(duration)
         if not secs or secs < 1 or secs > 28 * 86400:
-            return await interaction.response.send_message("Invalid duration (max 28d).", ephemeral=True)
-        until = now_utc() + timedelta(seconds=secs)
-        await member.timeout(timedelta(seconds=secs), reason=reason)
-        cid = await _create_case(interaction.guild.id, member.id, interaction.user.id,
-                                 "timeout", reason)
+            return await interaction.response.send_message(
+                "Invalid duration (max 28d).", ephemeral=True)
+        until = utcnow() + timedelta(seconds=secs)
+        try:
+            await member.timeout(timedelta(seconds=secs), reason=reason)
+        except discord.Forbidden:
+            return await interaction.response.send_message("❌ Forbidden.", ephemeral=True)
+        cid = await _create_case(interaction.guild.id, member.id,
+                                 interaction.user.id, "timeout", reason)
         tid = await db.execute(
-            "INSERT INTO timeouts (guild_id, user_id, moderator_id, reason, ends_at) "
+            "INSERT INTO timeouts "
+            "(guild_id, user_id, moderator_id, reason, ends_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (interaction.guild.id, member.id, interaction.user.id, reason, iso(until)))
-        await _try_action_dm(interaction.guild, member, "actiondm.timeout_msg",
-                             moderator=interaction.user.mention, reason=reason,
-                             duration=duration, timeout_end=fmt_dt(until),
-                             case_id=str(cid))
-        await bot.scheduler.schedule("timeout_end", until + timedelta(seconds=5),
-                                     {"timeout_id": tid}, interaction.guild.id)
+            (interaction.guild.id, member.id, interaction.user.id,
+             reason, to_iso(until)))
+        await _try_action_dm(
+            interaction.guild, member, "actiondm.timeout_msg",
+            moderator=interaction.user.mention, reason=reason,
+            duration=duration, timeout_end=fmt_dt(until),
+            case_id=str(cid),
+        )
+        await bot.scheduler.schedule(
+            "timeout_end", until + timedelta(seconds=5),
+            {"timeout_id": tid}, interaction.guild.id)
         await interaction.response.send_message(
             f"⏳ Timed out {member.mention} for {duration} (case #{cid}).")
 
@@ -2624,70 +2839,83 @@ def register_all_commands(bot: Freakos):
         ok, why = hierarchy_ok(interaction.guild, member)
         if not ok:
             return await interaction.response.send_message(f"❌ {why}", ephemeral=True)
-        await member.timeout(None, reason=f"Timeout removed by {interaction.user}")
+        try:
+            await member.timeout(None, reason=f"Timeout removed by {interaction.user}")
+        except discord.Forbidden:
+            return await interaction.response.send_message("❌ Forbidden.", ephemeral=True)
         await interaction.response.send_message("✅ Timeout removed.")
 
     @tree.command(name="kick", description="Kick a member.")
     @app_commands.default_permissions(kick_members=True)
-    async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
+    async def kick(interaction: discord.Interaction,
+                   member: discord.Member, reason: str = "No reason"):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         ok, why = hierarchy_ok(interaction.guild, member)
         if not ok:
             return await interaction.response.send_message(f"❌ {why}", ephemeral=True)
-        cid = await _create_case(interaction.guild.id, member.id, interaction.user.id,
-                                 "kick", reason)
-        await _try_action_dm(interaction.guild, member, "actiondm.kick_msg",
-                             moderator=interaction.user.mention, reason=reason,
-                             case_id=str(cid))
+        cid = await _create_case(interaction.guild.id, member.id,
+                                 interaction.user.id, "kick", reason)
+        # DM first — failure never cancels the kick
+        await _try_action_dm(
+            interaction.guild, member, "actiondm.kick_msg",
+            moderator=interaction.user.mention, reason=reason, case_id=str(cid))
         try:
             await member.kick(reason=reason)
         except discord.Forbidden:
             return await interaction.response.send_message("❌ Forbidden.", ephemeral=True)
         await interaction.response.send_message(f"👢 Kicked {member} (case #{cid}).")
-        await _log_guild(bot, interaction.guild, "kicks", "Member Kicked",
-                         f"**Member:** {member}\n**By:** {interaction.user.mention}\n**Reason:** {reason}")
+        await log_guild(bot, interaction.guild, "kicks", "Member Kicked",
+                        f"**Member:** {member}\n"
+                        f"**By:** {interaction.user.mention}\n"
+                        f"**Reason:** {reason}")
 
     @tree.command(name="ban", description="Ban a member.")
     @app_commands.default_permissions(ban_members=True)
-    async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason"):
+    async def ban(interaction: discord.Interaction,
+                  member: discord.Member, reason: str = "No reason"):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         ok, why = hierarchy_ok(interaction.guild, member)
         if not ok:
             return await interaction.response.send_message(f"❌ {why}", ephemeral=True)
-        cid = await _create_case(interaction.guild.id, member.id, interaction.user.id,
-                                 "ban", reason)
-        await _try_action_dm(interaction.guild, member, "actiondm.ban_msg",
-                             moderator=interaction.user.mention, reason=reason,
-                             case_id=str(cid))
+        cid = await _create_case(interaction.guild.id, member.id,
+                                 interaction.user.id, "ban", reason)
+        await _try_action_dm(
+            interaction.guild, member, "actiondm.ban_msg",
+            moderator=interaction.user.mention, reason=reason, case_id=str(cid))
         try:
             await member.ban(reason=reason)
         except discord.Forbidden:
             return await interaction.response.send_message("❌ Forbidden.", ephemeral=True)
         await interaction.response.send_message(f"🔨 Banned {member} (case #{cid}).")
-        await _log_guild(bot, interaction.guild, "bans", "Member Banned",
-                         f"**Member:** {member}\n**By:** {interaction.user.mention}\n**Reason:** {reason}")
+        await log_guild(bot, interaction.guild, "bans", "Member Banned",
+                        f"**Member:** {member}\n"
+                        f"**By:** {interaction.user.mention}\n"
+                        f"**Reason:** {reason}")
 
     @tree.command(name="unban", description="Unban by user ID.")
     @app_commands.default_permissions(ban_members=True)
-    async def unban(interaction: discord.Interaction, user_id: str, reason: str = "No reason"):
+    async def unban(interaction: discord.Interaction, user_id: str,
+                    reason: str = "No reason"):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         try:
             uid = int(user_id)
         except ValueError:
             return await interaction.response.send_message("Invalid ID.", ephemeral=True)
-        user = discord.Object(id=uid)
         try:
-            await interaction.guild.unban(user, reason=reason)
+            await interaction.guild.unban(discord.Object(id=uid), reason=reason)
         except discord.NotFound:
             return await interaction.response.send_message("User not banned.", ephemeral=True)
+        except discord.Forbidden:
+            return await interaction.response.send_message("❌ Forbidden.", ephemeral=True)
         await interaction.response.send_message(f"✅ Unbanned <@{uid}>.")
-        await _log_guild(bot, interaction.guild, "unbans", "Member Unbanned",
-                         f"**User:** <@{uid}>\n**By:** {interaction.user.mention}")
+        await log_guild(bot, interaction.guild, "unbans", "Member Unbanned",
+                        f"**User:** <@{uid}>\n"
+                        f"**By:** {interaction.user.mention}")
 
-    @tree.command(name="purge", description="Bulk delete messages.")
+    @tree.command(name="purge", description="Bulk-delete messages.")
     @app_commands.default_permissions(manage_messages=True)
     async def purge(interaction: discord.Interaction, amount: int,
                     member: Optional[discord.Member] = None):
@@ -2695,44 +2923,62 @@ def register_all_commands(bot: Freakos):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         amount = max(1, min(amount, 500))
         await interaction.response.defer(ephemeral=True)
-        def check(m):
-            return member is None or m.author.id == member.id
-        deleted = await interaction.channel.purge(limit=amount, check=check)
-        await interaction.followup.send(f"🗑 Deleted {len(deleted)} messages.", ephemeral=True)
 
-    @tree.command(name="slowmode", description="Set slowmode.")
+        def check(m: discord.Message) -> bool:
+            return member is None or m.author.id == member.id
+
+        try:
+            deleted = await interaction.channel.purge(limit=amount, check=check)
+        except discord.Forbidden:
+            return await interaction.followup.send("❌ Forbidden.", ephemeral=True)
+        await interaction.followup.send(
+            f"🗑 Deleted {len(deleted)} messages.", ephemeral=True)
+
+    @tree.command(name="slowmode", description="Set slowmode for a channel.")
     @app_commands.default_permissions(manage_channels=True)
     async def slowmode(interaction: discord.Interaction, seconds: int,
                        channel: Optional[discord.TextChannel] = None):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         ch = channel or interaction.channel
-        await ch.edit(slowmode_delay=max(0, min(seconds, 21600)))
-        await interaction.response.send_message(f"✅ Slowmode = {seconds}s in {ch.mention}.")
+        try:
+            await ch.edit(slowmode_delay=max(0, min(seconds, 21600)))
+        except Exception as e:
+            return await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Slowmode = {seconds}s in {ch.mention}.")
 
     @tree.command(name="lock", description="Lock a channel.")
     @app_commands.default_permissions(manage_channels=True)
-    async def lock(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    async def lock(interaction: discord.Interaction,
+                   channel: Optional[discord.TextChannel] = None):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         ch = channel or interaction.channel
-        ow = ch.overwrites_for(interaction.guild.default_role)
-        ow.send_messages = False
-        await ch.set_permissions(interaction.guild.default_role, overwrite=ow)
+        try:
+            ow = ch.overwrites_for(interaction.guild.default_role)
+            ow.send_messages = False
+            await ch.set_permissions(interaction.guild.default_role, overwrite=ow)
+        except Exception as e:
+            return await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
         await interaction.response.send_message(f"🔒 Locked {ch.mention}.")
 
     @tree.command(name="unlock", description="Unlock a channel.")
     @app_commands.default_permissions(manage_channels=True)
-    async def unlock(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    async def unlock(interaction: discord.Interaction,
+                     channel: Optional[discord.TextChannel] = None):
         if not is_admin_or_mod(interaction.user):
             return await interaction.response.send_message("No permission.", ephemeral=True)
         ch = channel or interaction.channel
-        ow = ch.overwrites_for(interaction.guild.default_role)
-        ow.send_messages = None
-        await ch.set_permissions(interaction.guild.default_role, overwrite=ow)
+        try:
+            ow = ch.overwrites_for(interaction.guild.default_role)
+            ow.send_messages = None
+            await ch.set_permissions(interaction.guild.default_role, overwrite=ow)
+        except Exception as e:
+            return await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
         await interaction.response.send_message(f"🔓 Unlocked {ch.mention}.")
 
-    @tree.command(name="lockdown", description="Lockdown the whole server (all text channels).")
+    @tree.command(name="lockdown", description="Lock every text channel in the server.")
     @app_commands.default_permissions(administrator=True)
     async def lockdown(interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
@@ -2770,35 +3016,36 @@ def register_all_commands(bot: Freakos):
     logging_grp = app_commands.Group(name="logging", description="Logging")
     tree.add_command(logging_grp)
 
-    @logging_grp.command(name="setup", description="Set log channel and enable common events.")
+    @logging_grp.command(name="setup", description="Set log channel & enable default events.")
     async def lg_setup(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "logging.channel", channel.id)
+        await db.set_cfg(interaction.guild.id, "logging.channel", channel.id)
+        await db.set_cfg(interaction.guild.id, "logging.enabled", "1")
         await db.set_json(interaction.guild.id, "logging.events", [
-            "joins", "leaves", "messages", "warnings", "kicks", "bans", "unbans",
-            "tickets", "shop", "automod",
+            "joins", "leaves", "messages", "warnings", "kicks", "bans",
+            "unbans", "tickets", "shop", "automod",
         ])
-        await interaction.response.send_message("✅ Logging set.", ephemeral=True)
+        await interaction.response.send_message("✅ Logging configured.", ephemeral=True)
 
     @logging_grp.command(name="enable", description="Enable logging.")
     async def lg_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "logging.enabled", "1")
+        await db.set_cfg(interaction.guild.id, "logging.enabled", "1")
         await interaction.response.send_message("✅ Enabled.", ephemeral=True)
 
     @logging_grp.command(name="disable", description="Disable logging.")
     async def lg_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "logging.enabled", "0")
+        await db.set_cfg(interaction.guild.id, "logging.enabled", "0")
         await interaction.response.send_message("✅ Disabled.", ephemeral=True)
 
-    @logging_grp.command(name="channel", description="Set log channel.")
+    @logging_grp.command(name="channel", description="Set the log channel.")
     async def lg_channel(interaction: discord.Interaction, channel: discord.TextChannel):
         if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "logging.channel", channel.id)
+        await db.set_cfg(interaction.guild.id, "logging.channel", channel.id)
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
-    @logging_grp.command(name="events", description="Set events (comma-separated).")
+    @logging_grp.command(name="events", description="Comma-separated event list.")
     async def lg_events(interaction: discord.Interaction, events: str):
         if not await require_admin(interaction): return
         evs = [e.strip() for e in events.split(",") if e.strip()]
@@ -2809,45 +3056,56 @@ def register_all_commands(bot: Freakos):
     async def lg_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         for k in ("logging.channel", "logging.events", "logging.enabled"):
-            await db.set_config(interaction.guild.id, k, None)
+            await db.set_cfg(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= REACTION ROLES =================
-    rr = app_commands.Group(name="reactionrole", description="Reaction/Button roles")
+    rr = app_commands.Group(name="reactionrole",
+                           description="Reaction / button role panels")
     tree.add_command(rr)
 
     @rr.command(name="setup", description="Create a new reaction-role panel.")
-    async def rr_setup(interaction: discord.Interaction, title: str, description: str = "",
+    async def rr_setup(interaction: discord.Interaction,
+                       title: str, description: str = "",
                        mode: str = "button"):
         if not await require_admin(interaction): return
         mode = mode.lower()
         if mode not in ("button", "select"):
-            return await interaction.response.send_message("mode must be `button` or `select`.", ephemeral=True)
+            return await interaction.response.send_message(
+                "mode must be `button` or `select`.", ephemeral=True)
         pid = await db.execute(
-            "INSERT INTO reaction_panels (guild_id, channel_id, title, description, mode) "
+            "INSERT INTO reaction_panels "
+            "(guild_id, channel_id, title, description, mode) "
             "VALUES (?, ?, ?, ?, ?)",
-            (interaction.guild.id, interaction.channel.id, title, description, mode))
+            (interaction.guild.id, interaction.channel.id,
+             title, description, mode))
         await interaction.response.send_message(
-            f"✅ Panel `#{pid}` created. Use `/reactionrole add panel_id:{pid} role:@role`.",
+            f"✅ Panel `#{pid}` created. "
+            f"Add roles with `/reactionrole add panel_id:{pid} role:@role`.",
             ephemeral=True)
 
     @rr.command(name="create", description="Post an existing panel.")
     async def rr_create(interaction: discord.Interaction, panel_id: int,
                         channel: Optional[discord.TextChannel] = None):
         if not await require_admin(interaction): return
-        p = await db.fetchone("SELECT * FROM reaction_panels WHERE id=? AND guild_id=?",
-                              (panel_id, interaction.guild.id))
+        p = await db.fetchone(
+            "SELECT * FROM reaction_panels WHERE id=? AND guild_id=?",
+            (panel_id, interaction.guild.id))
         if not p:
             return await interaction.response.send_message("Panel not found.", ephemeral=True)
         roles = await db.fetchall(
-            "SELECT role_id, label, emoji FROM reaction_roles WHERE panel_id=?", (panel_id,))
-        view = ReactionRoleView(panel_id, [dict(r) for r in roles], p["mode"] or "button")
+            "SELECT role_id, label, emoji FROM reaction_roles WHERE panel_id=?",
+            (panel_id,))
+        view = ReactionRoleView(panel_id, [dict(r) for r in roles],
+                                p["mode"] or "button")
         ch = channel or interaction.channel
-        msg = await ch.send(embed=make_embed(title=p["title"] or "Roles",
-                                             description=p["description"] or None), view=view)
-        await db.execute("UPDATE reaction_panels SET message_id=?, channel_id=? WHERE id=?",
-                         (msg.id, ch.id, panel_id))
-        # ensure the persistent view is registered
+        msg = await ch.send(
+            embed=make_embed(title=p["title"] or "Roles",
+                             description=p["description"] or None),
+            view=view)
+        await db.execute(
+            "UPDATE reaction_panels SET message_id=?, channel_id=? WHERE id=?",
+            (msg.id, ch.id, panel_id))
         bot.add_view(view, message_id=msg.id)
         await interaction.response.send_message("✅ Panel posted.", ephemeral=True)
 
@@ -2857,37 +3115,49 @@ def register_all_commands(bot: Freakos):
                      emoji: Optional[str] = None):
         if not await require_admin(interaction): return
         await db.execute(
-            "INSERT INTO reaction_roles (panel_id, role_id, label, emoji) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(panel_id, role_id) DO UPDATE SET label=excluded.label, emoji=excluded.emoji",
+            "INSERT INTO reaction_roles (panel_id, role_id, label, emoji) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(panel_id, role_id) DO UPDATE SET "
+            "label=excluded.label, emoji=excluded.emoji",
             (panel_id, role.id, label or role.name, emoji))
-        await interaction.response.send_message("✅ Added (re-post panel to update).", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ Added (re-post the panel to refresh).", ephemeral=True)
 
     @rr.command(name="remove", description="Remove a role from a panel.")
-    async def rr_remove(interaction: discord.Interaction, panel_id: int, role: discord.Role):
+    async def rr_remove(interaction: discord.Interaction,
+                        panel_id: int, role: discord.Role):
         if not await require_admin(interaction): return
-        await db.execute("DELETE FROM reaction_roles WHERE panel_id=? AND role_id=?",
-                         (panel_id, role.id))
+        await db.execute(
+            "DELETE FROM reaction_roles WHERE panel_id=? AND role_id=?",
+            (panel_id, role.id))
         await interaction.response.send_message("✅ Removed.", ephemeral=True)
 
-    @rr.command(name="list", description="List reaction role panels.")
+    @rr.command(name="list", description="List reaction-role panels.")
     async def rr_list(interaction: discord.Interaction):
         rows = await db.fetchall(
-            "SELECT * FROM reaction_panels WHERE guild_id=?", (interaction.guild.id,))
+            "SELECT * FROM reaction_panels WHERE guild_id=?",
+            (interaction.guild.id,))
+        if not rows:
+            return await interaction.response.send_message("*(none)*", ephemeral=True)
         lines = []
         for p in rows:
-            cnt = await db.fetchone("SELECT COUNT(*) c FROM reaction_roles WHERE panel_id=?",
-                                    (p["id"],))
+            cnt = await db.fetchone(
+                "SELECT COUNT(*) c FROM reaction_roles WHERE panel_id=?",
+                (p["id"],))
             lines.append(f"• `#{p['id']}` {p['title']} — {cnt['c']} role(s)")
-        await interaction.response.send_message("\n".join(lines) or "*(none)*", ephemeral=True)
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    @rr.command(name="reset", description="Reset reaction role panels.")
+    @rr.command(name="reset", description="Reset reaction-role panels.")
     async def rr_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        ids = await db.fetchall("SELECT id FROM reaction_panels WHERE guild_id=?",
-                                (interaction.guild.id,))
+        ids = await db.fetchall(
+            "SELECT id FROM reaction_panels WHERE guild_id=?",
+            (interaction.guild.id,))
         for r in ids:
-            await db.execute("DELETE FROM reaction_roles WHERE panel_id=?", (r["id"],))
-        await db.execute("DELETE FROM reaction_panels WHERE guild_id=?", (interaction.guild.id,))
+            await db.execute("DELETE FROM reaction_roles WHERE panel_id=?",
+                             (r["id"],))
+        await db.execute("DELETE FROM reaction_panels WHERE guild_id=?",
+                         (interaction.guild.id,))
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= GIVEAWAYS =================
@@ -2895,70 +3165,85 @@ def register_all_commands(bot: Freakos):
     tree.add_command(giveaway)
 
     @giveaway.command(name="create", description="Create a giveaway.")
-    async def gw_create(interaction: discord.Interaction, prize: str,
-                        duration: str, winners: int = 1,
+    async def gw_create(interaction: discord.Interaction,
+                        prize: str, duration: str, winners: int = 1,
                         channel: Optional[discord.TextChannel] = None):
         if not await require_admin(interaction): return
-        secs = parse_duration(duration)
+        secs = parse_dur(duration)
         if not secs:
             return await interaction.response.send_message("Invalid duration.", ephemeral=True)
+        winners = max(1, winners)
         ch = channel or interaction.channel
-        ends_at = now_utc() + timedelta(seconds=secs)
+        ends_at = utcnow() + timedelta(seconds=secs)
         embed = make_embed(
-            title=f"🎉 {prize}",
-            description=f"React with the button to enter!\n"
-                        f"**Winners:** {winners}\n**Ends:** {fmt_dt(ends_at)}")
+            title=f"🎉 {prize}"[:256],
+            description=(f"React with the button to enter!\n"
+                         f"**Winners:** {winners}\n**Ends:** {fmt_dt(ends_at)}"))
         gid = await db.execute(
-            "INSERT INTO giveaways (guild_id, channel_id, prize, winners, host_id, ends_at) "
+            "INSERT INTO giveaways "
+            "(guild_id, channel_id, prize, winners, host_id, ends_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (interaction.guild.id, ch.id, prize, winners, interaction.user.id, iso(ends_at)))
-        view = GiveawayView(gid)
+            (interaction.guild.id, ch.id, prize, winners,
+             interaction.user.id, to_iso(ends_at)))
+        view = GiveawayView()
         msg = await ch.send(embed=embed, view=view)
-        await db.execute("UPDATE giveaways SET message_id=? WHERE id=?", (msg.id, gid))
+        await db.execute("UPDATE giveaways SET message_id=? WHERE id=?",
+                         (msg.id, gid))
         bot.add_view(view, message_id=msg.id)
-        await bot.scheduler.schedule("giveaway_end", ends_at, {"giveaway_id": gid},
-                                     interaction.guild.id)
-        await interaction.response.send_message(f"✅ Giveaway `#{gid}` started.", ephemeral=True)
+        await bot.scheduler.schedule(
+            "giveaway_end", ends_at, {"giveaway_id": gid}, interaction.guild.id)
+        await interaction.response.send_message(
+            f"✅ Giveaway `#{gid}` started.", ephemeral=True)
 
-    @giveaway.command(name="end", description="End a giveaway immediately.")
+    @giveaway.command(name="end", description="End a giveaway now.")
     async def gw_end(interaction: discord.Interaction, giveaway_id: int):
         if not await require_admin(interaction): return
-        await _end_giveaway(bot, giveaway_id)
+        await end_giveaway(bot, giveaway_id)
         await interaction.response.send_message("✅ Ended.", ephemeral=True)
 
-    @giveaway.command(name="reroll", description="Reroll winners.")
+    @giveaway.command(name="reroll", description="Reroll the winners.")
     async def gw_reroll(interaction: discord.Interaction, giveaway_id: int):
         if not await require_admin(interaction): return
-        await _end_giveaway(bot, giveaway_id, reroll=True)
+        await end_giveaway(bot, giveaway_id, reroll=True)
         await interaction.response.send_message("✅ Rerolled.", ephemeral=True)
 
     @giveaway.command(name="list", description="List giveaways.")
     async def gw_list(interaction: discord.Interaction):
-        rows = await db.fetchall("SELECT * FROM giveaways WHERE guild_id=? ORDER BY id DESC",
-                                 (interaction.guild.id,))
-        lines = [f"• `#{r['id']}` **{r['prize']}** — {'ended' if r['ended'] else fmt_dt(parse_iso(r['ends_at']))}"
-                 for r in rows]
-        await interaction.response.send_message("\n".join(lines) or "*(none)*", ephemeral=True)
+        rows = await db.fetchall(
+            "SELECT * FROM giveaways WHERE guild_id=? ORDER BY id DESC",
+            (interaction.guild.id,))
+        if not rows:
+            return await interaction.response.send_message("*(none)*", ephemeral=True)
+        lines = [
+            f"• `#{r['id']}` **{r['prize']}** — "
+            f"{'ended' if r['ended'] else fmt_dt(from_iso(r['ends_at']))}"
+            for r in rows
+        ]
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     # ================= CUSTOM COMMANDS =================
     cc = app_commands.Group(name="customcommand", description="Custom text commands")
     tree.add_command(cc)
 
     @cc.command(name="create", description="Create a custom command.")
-    async def cc_create(interaction: discord.Interaction, name: str, response: str,
-                        embed: bool = False):
+    async def cc_create(interaction: discord.Interaction, name: str,
+                        response: str, embed: bool = False):
         if not await require_admin(interaction): return
         await db.execute(
-            "INSERT INTO custom_commands (guild_id, name, response, embed, enabled) "
+            "INSERT INTO custom_commands "
+            "(guild_id, name, response, embed, enabled) "
             "VALUES (?, ?, ?, ?, 1) "
-            "ON CONFLICT(guild_id, name) DO UPDATE SET response=excluded.response, embed=excluded.embed",
+            "ON CONFLICT(guild_id, name) DO UPDATE SET "
+            "response=excluded.response, embed=excluded.embed",
             (interaction.guild.id, name.lower(), response, 1 if embed else 0))
         await interaction.response.send_message(
-            f"✅ Created `!{name}`. Supports newlines and placeholders.", ephemeral=True)
+            f"✅ Created `!{name}` (supports newlines / placeholders).",
+            ephemeral=True)
 
     @cc.command(name="edit", description="Edit a custom command.")
     async def cc_edit(interaction: discord.Interaction, name: str,
-                      response: Optional[str] = None, embed: Optional[bool] = None,
+                      response: Optional[str] = None,
+                      embed: Optional[bool] = None,
                       enabled: Optional[bool] = None):
         if not await require_admin(interaction): return
         updates, params = [], []
@@ -2969,30 +3254,36 @@ def register_all_commands(bot: Freakos):
         if enabled is not None:
             updates.append("enabled=?"); params.append(1 if enabled else 0)
         if not updates:
-            return await interaction.response.send_message("Nothing.", ephemeral=True)
+            return await interaction.response.send_message("Nothing to update.", ephemeral=True)
         params += [interaction.guild.id, name.lower()]
-        await db.execute(f"UPDATE custom_commands SET {', '.join(updates)} "
-                         "WHERE guild_id=? AND name=?", tuple(params))
+        await db.execute(
+            f"UPDATE custom_commands SET {', '.join(updates)} "
+            "WHERE guild_id=? AND name=?", tuple(params))
         await interaction.response.send_message("✅ Updated.", ephemeral=True)
 
     @cc.command(name="delete", description="Delete a custom command.")
     async def cc_delete(interaction: discord.Interaction, name: str):
         if not await require_admin(interaction): return
-        await db.execute("DELETE FROM custom_commands WHERE guild_id=? AND name=?",
-                         (interaction.guild.id, name.lower()))
+        await db.execute(
+            "DELETE FROM custom_commands WHERE guild_id=? AND name=?",
+            (interaction.guild.id, name.lower()))
         await interaction.response.send_message("✅ Deleted.", ephemeral=True)
 
     @cc.command(name="list", description="List custom commands.")
     async def cc_list(interaction: discord.Interaction):
-        rows = await db.fetchall("SELECT name, enabled FROM custom_commands WHERE guild_id=?",
-                                 (interaction.guild.id,))
+        rows = await db.fetchall(
+            "SELECT name, enabled FROM custom_commands WHERE guild_id=?",
+            (interaction.guild.id,))
+        if not rows:
+            return await interaction.response.send_message("*(none)*", ephemeral=True)
         lines = [f"• `!{r['name']}` {'🟢' if r['enabled'] else '⚪'}" for r in rows]
-        await interaction.response.send_message("\n".join(lines) or "*(none)*", ephemeral=True)
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @cc.command(name="reset", description="Reset custom commands.")
     async def cc_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        await db.execute("DELETE FROM custom_commands WHERE guild_id=?", (interaction.guild.id,))
+        await db.execute("DELETE FROM custom_commands WHERE guild_id=?",
+                         (interaction.guild.id,))
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
     # ================= ANNOUNCEMENTS =================
@@ -3000,15 +3291,17 @@ def register_all_commands(bot: Freakos):
     tree.add_command(ann)
 
     @ann.command(name="create", description="Create an announcement draft.")
-    async def a_create(interaction: discord.Interaction, channel: discord.TextChannel,
-                       title: str, body: str,
+    async def a_create(interaction: discord.Interaction,
+                       channel: discord.TextChannel, title: str, body: str,
                        image: Optional[str] = None, footer: Optional[str] = None):
         if not await require_admin(interaction): return
         aid = await db.execute(
-            "INSERT INTO announcements (guild_id, channel_id, title, body, image, footer, sent) "
+            "INSERT INTO announcements "
+            "(guild_id, channel_id, title, body, image, footer, sent) "
             "VALUES (?, ?, ?, ?, ?, ?, 0)",
             (interaction.guild.id, channel.id, title, body, image, footer))
-        await interaction.response.send_message(f"✅ Announcement `#{aid}` created.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Announcement `#{aid}` created.", ephemeral=True)
 
     @ann.command(name="edit", description="Edit an announcement.")
     async def a_edit(interaction: discord.Interaction, announcement_id: int,
@@ -3016,79 +3309,60 @@ def register_all_commands(bot: Freakos):
                      image: Optional[str] = None, footer: Optional[str] = None):
         if not await require_admin(interaction): return
         updates, params = [], []
-        for col, val in (("title", title), ("body", body), ("image", image), ("footer", footer)):
+        for col, val in (("title", title), ("body", body),
+                         ("image", image), ("footer", footer)):
             if val is not None:
-                updates.append(f"{col}=?"); params.append(val)
+                updates.append(f"{col}=?")
+                params.append(val)
         if not updates:
-            return await interaction.response.send_message("Nothing.", ephemeral=True)
+            return await interaction.response.send_message("Nothing to update.", ephemeral=True)
         params += [announcement_id, interaction.guild.id]
-        await db.execute(f"UPDATE announcements SET {', '.join(updates)} "
-                         "WHERE id=? AND guild_id=?", tuple(params))
+        await db.execute(
+            f"UPDATE announcements SET {', '.join(updates)} "
+            "WHERE id=? AND guild_id=?", tuple(params))
         await interaction.response.send_message("✅ Updated.", ephemeral=True)
 
     @ann.command(name="send", description="Send an announcement now.")
     async def a_send(interaction: discord.Interaction, announcement_id: int):
         if not await require_admin(interaction): return
-        await _run_announcement(bot, {"announcement_id": announcement_id})
+        await _task_announcement(bot, {"announcement_id": announcement_id})
         await interaction.response.send_message("✅ Sent.", ephemeral=True)
 
     @ann.command(name="schedule", description="Schedule an announcement.")
     async def a_schedule(interaction: discord.Interaction, announcement_id: int,
                          in_duration: str):
         if not await require_admin(interaction): return
-        secs = parse_duration(in_duration)
+        secs = parse_dur(in_duration)
         if not secs:
             return await interaction.response.send_message("Invalid duration.", ephemeral=True)
-        run_at = now_utc() + timedelta(seconds=secs)
-        await db.execute("UPDATE announcements SET scheduled_at=? WHERE id=? AND guild_id=?",
-                         (iso(run_at), announcement_id, interaction.guild.id))
-        await bot.scheduler.schedule("announcement", run_at, {"announcement_id": announcement_id},
-                                     interaction.guild.id)
-        await interaction.response.send_message(f"✅ Scheduled for {fmt_dt(run_at)}.", ephemeral=True)
+        run_at = utcnow() + timedelta(seconds=secs)
+        await db.execute(
+            "UPDATE announcements SET scheduled_at=? WHERE id=? AND guild_id=?",
+            (to_iso(run_at), announcement_id, interaction.guild.id))
+        # Cancel any prior pending schedule for the same announcement
+        await bot.scheduler.cancel_pending(
+            "announcement", f'%"announcement_id": {announcement_id}%')
+        await bot.scheduler.schedule(
+            "announcement", run_at, {"announcement_id": announcement_id},
+            interaction.guild.id)
+        await interaction.response.send_message(
+            f"✅ Scheduled for {fmt_dt(run_at)}.", ephemeral=True)
 
     @ann.command(name="cancel", description="Cancel a scheduled announcement.")
     async def a_cancel(interaction: discord.Interaction, announcement_id: int):
         if not await require_admin(interaction): return
-        await db.execute("UPDATE scheduled_tasks SET completed=1 "
-                         "WHERE task_type='announcement' AND completed=0 "
-                         "AND payload LIKE ?", (f'%"announcement_id": {announcement_id}%',))
-        await interaction.response.send_message("✅ Cancelled (pending tasks marked complete).", ephemeral=True)
+        await bot.scheduler.cancel_pending(
+            "announcement", f'%"announcement_id": {announcement_id}%')
+        await interaction.response.send_message("✅ Cancelled.", ephemeral=True)
 
 
-# =====================================================================
-# Modal helper
-# =====================================================================
+# ============================================================
+# STARTUP
+# ============================================================
 
-class TextModal(discord.ui.Modal):
-    def __init__(self, title: str, default: str, on_submit):
-        super().__init__(title=title[:45])
-        self._on_submit_cb = on_submit
-        self.text = discord.ui.TextInput(
-            label="Message",
-            style=discord.TextStyle.paragraph,
-            default=default[:4000] if default else "",
-            max_length=4000,
-            required=False,
-        )
-        self.add_item(self.text)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await self._on_submit_cb(interaction, self.text.value)
-
-
-async def _save_and_reply(interaction: discord.Interaction, key: str, value: str):
-    # Preserve newlines exactly — do NOT strip / split / join.
-    await interaction.client.db.set_config(interaction.guild.id, key, value)
-    await interaction.response.send_message("✅ Saved.", ephemeral=True)
-
-
-# =====================================================================
-# Entry point
-# =====================================================================
-
-async def main():
+async def main() -> None:
     if not TOKEN:
-        log.error("DISCORD_TOKEN missing. Set it in your environment / .env file.")
+        log.error("DISCORD_TOKEN is missing. Set it in your environment or .env file.")
         return
     bot = Freakos()
     try:
