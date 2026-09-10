@@ -785,8 +785,56 @@ async def _end_giveaway(bot: 'Freakos', gid: int, reroll: bool=False):
     if not reroll:
         await bot.db.execute('UPDATE giveaways SET ended=1 WHERE id=?', (gid,))
 class Freakos(commands.Bot):
-    def __init__(self): intents = discord.Intents.default(); intents.guilds = True; intents.members = True; intents.messages = True; intents.message_content = True; intents.voice_states = True; super().__init__(command_prefix='!', intents=intents, help_command=None); self.db = Database(DB_PATH); self.scheduler: Optional[Scheduler] = None; self._vc_cache: dict[int, int] = {}; self._spam_tracker: dict[tuple, list[float]] = {}
-    async def setup_hook(self): await self.db.connect(); self.scheduler = Scheduler(self); self.scheduler.start(); register_all_commands(self); await self._restore_persistent_views(); await self._restore_scheduled_tasks()
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.guilds = True
+        intents.members = True
+        intents.messages = True
+        intents.message_content = True
+        intents.voice_states = True
+        super().__init__(command_prefix='!', intents=intents, help_command=None)
+        self.db = Database(DB_PATH)
+        self.scheduler: Optional[Scheduler] = None
+        self._vc_cache: dict[int, int] = {}
+        self._spam_tracker: dict[tuple, list[float]] = {}
+        self._commands_synced = False
+
+    async def setup_hook(self):
+        await self.db.connect()
+        self.scheduler = Scheduler(self)
+        self.scheduler.start()
+        register_all_commands(self)
+        await self._restore_persistent_views()
+        await self._restore_scheduled_tasks()
+
+    async def _sync_commands_now(self):
+        # Guild-sync the complete tree so new subcommands appear immediately.
+        if self._commands_synced:
+            return
+        synced_total = 0
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                synced_total += len(synced)
+                log.info('Synced %d commands to guild %s (%s)', len(synced), guild.name, guild.id)
+            except Exception:
+                log.exception('Failed to sync commands to guild %s (%s)', guild.name, guild.id)
+        try:
+            global_synced = await self.tree.sync()
+            log.info('Global command sync complete: %d commands', len(global_synced))
+        except Exception:
+            log.exception('Global command sync failed')
+        self._commands_synced = True
+        log.info('Immediate command sync complete: %d commands across %d guild(s)', synced_total, len(self.guilds))
+
+    async def on_ready(self):
+        log.info('Logged in as %s (%s) | guilds=%d', self.user, self.user.id, len(self.guilds))
+        await self._sync_commands_now()
+        try:
+            await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='over the server'))
+        except Exception:
+            pass
     async def _restore_persistent_views(self):
         self.add_view(TicketCreateButton())
         self.add_view(ShopPanelView())
@@ -812,8 +860,30 @@ class Freakos(commands.Bot):
             await self.db.close()
         finally:
             await super().close()
+    async def _sync_commands_now(self):
+        # Guild-sync the complete tree so new subcommands appear immediately.
+        if self._commands_synced:
+            return
+        synced_total = 0
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                synced_total += len(synced)
+                log.info('Synced %d commands to guild %s (%s)', len(synced), guild.name, guild.id)
+            except Exception:
+                log.exception('Failed to sync commands to guild %s (%s)', guild.name, guild.id)
+        try:
+            global_synced = await self.tree.sync()
+            log.info('Global command sync complete: %d commands', len(global_synced))
+        except Exception:
+            log.exception('Global command sync failed')
+        self._commands_synced = True
+        log.info('Immediate command sync complete: %d commands across %d guild(s)', synced_total, len(self.guilds))
+
     async def on_ready(self):
         log.info('Logged in as %s (%s) | guilds=%d', self.user, self.user.id, len(self.guilds))
+        await self._sync_commands_now()
         try:
             await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='over the server'))
         except Exception:
@@ -2307,4 +2377,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
