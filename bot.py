@@ -317,11 +317,11 @@ class TicketManageView(discord.ui.View):
 
         claim = discord.ui.Button(
             label="Claim", style=discord.ButtonStyle.success,
-            custom_id=f"freakos:ticket:claim:{ticket_id}"
+            custom_id="freakos:ticket:claim"
         )
         close = discord.ui.Button(
             label="Close", style=discord.ButtonStyle.secondary,
-            custom_id=f"freakos:ticket:close:{ticket_id}"
+            custom_id="freakos:ticket:close"
         )
         claim.callback = self._claim
         close.callback = self._close
@@ -454,7 +454,7 @@ async def _toggle_role(interaction: discord.Interaction, role_id: int):
         await interaction.response.send_message('I lack permission (check role hierarchy).', ephemeral=True)
 class GiveawayView(discord.ui.View):
     def __init__(self, giveaway_id: int): super().__init__(timeout=None); self.giveaway_id = giveaway_id
-    @discord.ui.button(label='Enter', style=discord.ButtonStyle.success, emoji='🎉', custom_id=f'freakos:gw:enter:{giveaway_id}')
+    @discord.ui.button(label='Enter', style=discord.ButtonStyle.success, emoji='🎉', custom_id='freakos:gw:enter')
     async def enter(self, interaction: discord.Interaction, _):
         gw = await interaction.client.db.fetchone('SELECT * FROM giveaways WHERE id=?', (self.giveaway_id,))
         if not gw or gw['ended']:
