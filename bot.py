@@ -409,14 +409,14 @@ class TicketManageView(discord.ui.View):
         super().__init__(timeout=None)
         self.ticket_id = ticket_id
         controls = [
-            ('Claim', discord.ButtonStyle.success, 'claim', 0),
-            ('Close', discord.ButtonStyle.secondary, 'close', 0),
-            ('Close + Reason', discord.ButtonStyle.danger, 'close_reason', 0),
-            ('Reopen', discord.ButtonStyle.success, 'reopen', 1),
-            ('Add User', discord.ButtonStyle.secondary, 'add', 1),
-            ('Remove User', discord.ButtonStyle.secondary, 'remove', 1),
-            ('Transcript', discord.ButtonStyle.secondary, 'transcript', 1),
-            ('Delete', discord.ButtonStyle.danger, 'delete', 2),
+            ('ᴄʟᴀɪᴍ', discord.ButtonStyle.success, 'claim', 0),
+            ('ᴄʟᴏꜱᴇ', discord.ButtonStyle.secondary, 'close', 0),
+            ('ᴄʟᴏꜱᴇ + ʀᴇᴀꜱᴏɴ', discord.ButtonStyle.danger, 'close_reason', 0),
+            ('ʀᴇᴏᴘᴇɴ', discord.ButtonStyle.success, 'reopen', 1),
+            ('ᴀᴅᴅ ᴜꜱᴇʀ', discord.ButtonStyle.secondary, 'add', 1),
+            ('ʀᴇᴍᴏᴠᴇ ᴜꜱᴇʀ', discord.ButtonStyle.secondary, 'remove', 1),
+            ('ᴛʀᴀɴꜱᴄʀɪᴘᴛ', discord.ButtonStyle.secondary, 'transcript', 1),
+            ('ᴅᴇʟᴇᴛᴇ', discord.ButtonStyle.danger, 'delete', 2),
         ]
         for label, style, action, row in controls:
             b = discord.ui.Button(label=label, style=style, custom_id=f'freakos:ticket:{action}:{ticket_id}', row=row)
@@ -2307,3 +2307,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
