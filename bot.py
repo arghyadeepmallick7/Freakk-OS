@@ -10,7 +10,6 @@ import logging
 import os
 import random
 import re
-import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -112,7 +111,6 @@ def chunk_message(text: str, limit: int = 1990) -> list[str]:
     chunks: list[str] = []
     cur = ""
     for line in text.split("\n"):
-        # Hard-split extremely long single lines
         while len(line) > limit:
             if cur:
                 chunks.append(cur)
@@ -180,16 +178,161 @@ def hierarchy_ok(guild: discord.Guild, target: discord.Member) -> tuple[bool, st
     return True, ""
 
 
+# =====================================================================
+# Welcome / Departure shared renderers
+# ---------------------------------------------------------------------
+# These are the SINGLE rendering paths used by BOTH the /welcome &
+# /departure test commands AND the real on_member_join / on_member_remove
+# events.  Never duplicate this logic elsewhere.
+# =====================================================================
+
+def _member_placeholders(member: discord.Member) -> dict:
+    """Standard placeholder dict for welcome / departure."""
+    g = member.guild
+    return {
+        "user": member.name,
+        "username": member.name,
+        "display_name": member.display_name,
+        "member": member.display_name or member.name,
+        "mention": member.mention,
+        "user_id": str(member.id),
+        "server": g.name,
+        "server_name": g.name,
+        "server_id": str(g.id),
+        "member_count": str(g.member_count),
+    }
+
+
+def _apply_embed_cfg(embed: discord.Embed, cfg: dict, ph: dict) -> discord.Embed:
+    """
+    Apply a stored embed config dict to an Embed.  Text fields (title,
+    footer, author) are passed through placeholder substitution and
+    truncated to Discord's limits.  Newlines are never touched.
+    """
+    t = cfg.get("title")
+    if t:
+        embed.title = apply_placeholders(str(t), **ph)[:256]
+    f = cfg.get("footer")
+    if f:
+        embed.set_footer(text=apply_placeholders(str(f), **ph)[:2048])
+    a = cfg.get("author")
+    if a:
+        embed.set_author(name=apply_placeholders(str(a), **ph)[:256])
+    c = cfg.get("color")
+    if c is not None:
+        try:
+            embed.color = discord.Color(int(c))
+        except Exception:
+            pass
+    if cfg.get("image"):
+        try:
+            embed.set_image(url=str(cfg["image"]))
+        except Exception:
+            pass
+    if cfg.get("thumbnail"):
+        try:
+            embed.set_thumbnail(url=str(cfg["thumbnail"]))
+        except Exception:
+            pass
+    embed.timestamp = now_utc()
+    return embed
+
+
+async def _send_welcome_member(bot: "Freakos", member: discord.Member,
+                               force: bool = False) -> None:
+    """
+    Welcome renderer.  Used by /welcome test AND on_member_join.
+
+    - Reads `welcome.message` (used as description when embed is active,
+      or as plain text when embed is not active).
+    - Reads `welcome.embed` JSON config (`enabled`, `title`, `footer`,
+      `color`, `image`, `thumbnail`, `author`).
+    - Never falls back to plain text when an embed config exists.
+    - Never crashes the bot; logs and returns on failure.
+    """
+    guild = member.guild
+    if not force:
+        if await bot.db.get_config(guild.id, "welcome.enabled", "0") != "1":
+            return
+    ch_id = await bot.db.get_config(guild.id, "welcome.channel")
+    ch = guild.get_channel(int(ch_id)) if ch_id else None
+    if not isinstance(ch, discord.TextChannel):
+        return
+
+    tpl = await bot.db.get_config(guild.id, "welcome.message") or \
+        "Welcome {mention} to **{server}**!"
+    ph = _member_placeholders(member)
+    rendered = apply_placeholders(tpl, **ph)
+
+    embed_cfg = await bot.db.get_json(guild.id, "welcome.embed", default=None)
+    if embed_cfg and embed_cfg.get("enabled", True):
+        embed = discord.Embed(description=rendered[:4096])
+        _apply_embed_cfg(embed, embed_cfg, ph)
+        try:
+            await ch.send(embed=embed)
+        except Exception:
+            log.exception("welcome embed send failed")
+        return
+
+    try:
+        for c in chunk_message(rendered):
+            await ch.send(c)
+    except Exception:
+        log.exception("welcome message send failed")
+
+
+async def _send_departure_member(bot: "Freakos", member: discord.Member,
+                                 force: bool = False) -> None:
+    """
+    Departure renderer.  Used by /departure test AND on_member_remove.
+
+    - Reads `departure.message` (description when embed active / plain
+      text otherwise).
+    - Reads `departure.embed` JSON config, same shape as welcome.embed.
+    - Never falls back to plain text when an embed config exists.
+    """
+    guild = member.guild
+    if not force:
+        if await bot.db.get_config(guild.id, "departure.enabled", "0") != "1":
+            return
+    ch_id = await bot.db.get_config(guild.id, "departure.channel")
+    ch = guild.get_channel(int(ch_id)) if ch_id else None
+    if not isinstance(ch, discord.TextChannel):
+        return
+
+    tpl = await bot.db.get_config(guild.id, "departure.message") or \
+        "**{user}** left the server."
+    ph = _member_placeholders(member)
+    rendered = apply_placeholders(tpl, **ph)
+
+    embed_cfg = await bot.db.get_json(guild.id, "departure.embed", default=None)
+    if embed_cfg and embed_cfg.get("enabled", True):
+        embed = discord.Embed(description=rendered[:4096])
+        _apply_embed_cfg(embed, embed_cfg, ph)
+        try:
+            await ch.send(embed=embed)
+        except Exception:
+            log.exception("departure embed send failed")
+        return
+
+    try:
+        for c in chunk_message(rendered):
+            await ch.send(c)
+    except Exception:
+        log.exception("departure message send failed")
+
+
+# ---------------------------------------------------------------------
+# VC notification helper (unchanged from previous fix)
+# ---------------------------------------------------------------------
+
 async def _send_to_vc_chat(voice_channel: discord.VoiceChannel, content: str) -> bool:
     """
     Send a notification into a voice channel's OWN text chat.
 
-    discord.py 2.x exposes `VoiceChannel.send()` for text-in-voice channels
-    (`VocalGuildChannel` is `Messageable`). If the voice channel has no text
-    chat enabled, or the bot lacks permission, Discord raises Forbidden /
-    NotFound — we log it and return False. We NEVER fall back to a different
-    text channel, so a VC notification can only ever appear inside its own
-    VC chat.
+    discord.py 2.x exposes `VoiceChannel.send()` for text-in-voice channels.
+    If the voice channel has no text chat or we lack permission, we log and
+    return False. We NEVER fall back to a different text channel.
     """
     if not content:
         return False
@@ -199,8 +342,7 @@ async def _send_to_vc_chat(voice_channel: discord.VoiceChannel, content: str) ->
         return True
     except (discord.Forbidden, discord.NotFound) as e:
         log.warning(
-            "VC notify: cannot send to voice channel '%s' (%s): %s "
-            "(does it have a text chat enabled? do I have Send Messages there?)",
+            "VC notify: cannot send to voice channel '%s' (%s): %s",
             getattr(voice_channel, "name", "?"),
             getattr(voice_channel, "id", "?"),
             e,
@@ -412,7 +554,6 @@ class Database:
             cur = await self.conn.execute(sql, params)
             return await cur.fetchall()
 
-    # ---- config helpers ----
     async def get_config(self, guild_id: int, key: str, default=None):
         row = await self.fetchone(
             "SELECT value FROM guild_config WHERE guild_id=? AND key=?",
@@ -656,7 +797,6 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
     if not row:
         return await interaction.response.send_message("Type not found.", ephemeral=True)
 
-    # limit & cooldown
     limit = int(await db.get_config(guild.id, "ticket.limit", "1") or 1)
     open_count = await db.fetchone(
         "SELECT COUNT(*) c FROM tickets WHERE guild_id=? AND user_id=? AND status='open'",
@@ -729,7 +869,6 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
         pass
     await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
 
-    # logging
     await _log_guild(interaction.client, guild, "tickets", "Ticket Opened",
                      f"{interaction.user.mention} opened `{ttype}` → {channel.mention}")
 
@@ -827,7 +966,6 @@ class GiveawayView(discord.ui.View):
         await interaction.response.send_message("✅ Entered!", ephemeral=True)
 
 
-# Shop/buy uses modals dynamically; no persistent view needed beyond panels
 class ShopPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -934,11 +1072,9 @@ async def _run_timeout_end(bot: "Freakos", payload: dict):
         return
     member = guild.get_member(row["user_id"])
     if member:
-        # Only send if user was actually timed out and now isn't
         try:
             until = member.timed_out_until
             if until and until > now_utc():
-                # still timed out, re-schedule
                 await bot.scheduler.schedule(
                     "timeout_end",
                     until + timedelta(seconds=5),
@@ -1057,10 +1193,9 @@ class Freakos(commands.Bot):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.db = Database(DB_PATH)
         self.scheduler: Optional[Scheduler] = None
-        self._vc_cache: dict[int, int] = {}  # user_id -> channel_id (in memory for dedupe)
+        self._vc_cache: dict[int, int] = {}
         self._spam_tracker: dict[tuple, list[float]] = {}
 
-    # ---------- lifecycle ----------
     async def setup_hook(self):
         await self.db.connect()
         self.scheduler = Scheduler(self)
@@ -1070,18 +1205,14 @@ class Freakos(commands.Bot):
         await self._restore_scheduled_tasks()
 
     async def _restore_persistent_views(self):
-        # Ticket panel
         self.add_view(TicketCreateButton())
         self.add_view(ShopPanelView())
-        # Ticket manage views: readd per open ticket
         rows = await self.db.fetchall("SELECT id FROM tickets WHERE status='open'")
         for r in rows:
             self.add_view(TicketManageView(r["id"]))
-        # Giveaways
         gws = await self.db.fetchall("SELECT id FROM giveaways WHERE ended=0")
         for g in gws:
             self.add_view(GiveawayView(g["id"]))
-        # Reaction role panels
         panels = await self.db.fetchall("SELECT * FROM reaction_panels")
         for p in panels:
             roles = await self.db.fetchall(
@@ -1116,7 +1247,6 @@ class Freakos(commands.Bot):
         except Exception:
             pass
 
-    # ===== Task dispatch handlers (called by Scheduler) =====
     async def task_timeout_end(self, payload: dict):
         await _run_timeout_end(self, payload)
 
@@ -1129,29 +1259,14 @@ class Freakos(commands.Bot):
     # ===== Events =====
     async def on_member_join(self, member: discord.Member):
         guild = member.guild
-        # Welcome
-        enabled = await self.db.get_config(guild.id, "welcome.enabled", "0")
-        if enabled == "1":
-            ch_id = await self.db.get_config(guild.id, "welcome.channel")
-            ch = guild.get_channel(int(ch_id)) if ch_id else None
-            if ch:
-                msg_tpl = await self.db.get_config(guild.id, "welcome.message") or \
-                    "Welcome {mention} to **{server}**!"
-                rendered = apply_placeholders(
-                    msg_tpl,
-                    user=member.name,
-                    mention=member.mention,
-                    username=member.name,
-                    display_name=member.display_name,
-                    server=guild.name,
-                    member_count=str(guild.member_count),
-                )
-                try:
-                    for c in chunk_message(rendered):
-                        await ch.send(c)
-                except Exception:
-                    pass
-        # Autorole
+
+        # ---- Welcome (plain text OR configured embed — same code path) ----
+        try:
+            await _send_welcome_member(self, member)
+        except Exception:
+            log.exception("welcome error")
+
+        # ---- Autorole ----
         if await self.db.get_config(guild.id, "autorole.enabled", "0") == "1":
             roles = await self.db.get_json(guild.id, "autorole.roles", default=[])
             good = []
@@ -1164,7 +1279,8 @@ class Freakos(commands.Bot):
                     await member.add_roles(*good, reason="Autorole")
                 except Exception:
                     log.exception("Autorole failed")
-        # Autonick
+
+        # ---- Autonick ----
         if await self.db.get_config(guild.id, "autonick.enabled", "0") == "1":
             fmt = await self.db.get_config(guild.id, "autonick.format") or "{user}"
             nick = apply_placeholders(
@@ -1177,28 +1293,19 @@ class Freakos(commands.Bot):
                     await member.edit(nick=nick, reason="Autonick")
             except Exception:
                 pass
-        # Logging
+
         await _log_guild(self, guild, "joins", "Member Joined",
                          f"{member.mention} ({member})")
 
     async def on_member_remove(self, member: discord.Member):
         guild = member.guild
-        if await self.db.get_config(guild.id, "departure.enabled", "0") == "1":
-            ch_id = await self.db.get_config(guild.id, "departure.channel")
-            ch = guild.get_channel(int(ch_id)) if ch_id else None
-            if ch:
-                tpl = await self.db.get_config(guild.id, "departure.message") or \
-                    "**{user}** left the server."
-                rendered = apply_placeholders(
-                    tpl, user=member.name, username=member.name,
-                    display_name=member.display_name, mention=member.mention,
-                    server=guild.name, member_count=str(guild.member_count),
-                )
-                try:
-                    for c in chunk_message(rendered):
-                        await ch.send(c)
-                except Exception:
-                    pass
+
+        # ---- Departure (plain text OR configured embed — same code path) ----
+        try:
+            await _send_departure_member(self, member)
+        except Exception:
+            log.exception("departure error")
+
         await _log_guild(self, guild, "leaves", "Member Left",
                          f"{member.mention} ({member})")
 
@@ -1225,29 +1332,24 @@ class Freakos(commands.Bot):
                                     after: discord.VoiceState):
         guild = member.guild
 
-        # Never notify for bots (including ourselves).
         if member.bot:
             return
 
         old_id = before.channel.id if before.channel else None
         new_id = after.channel.id if after.channel else None
 
-        # Mute / deafen / stream / camera changes keep the same channel — ignore.
         if old_id == new_id:
             return
 
-        # Global enable flag (defaults ON so existing setups keep working).
         if await self.db.get_config(guild.id, "vcnotify.enabled", "1") != "1":
             return
 
-        # Legacy per-user cache kept for compatibility; harmless.
         self._vc_cache[member.id] = new_id or 0
 
         watch = await self.db.get_json(guild.id, "vcnotify.channels", default=[])
         if not watch:
             return
 
-        # ---- LEAVE event: send to SOURCE VC's own text chat ----
         if old_id and old_id in watch and before.channel is not None:
             cfg = await self.db.get_json(guild.id, f"vcnotify.cfg.{old_id}", default={})
             if cfg.get("enabled", True):
@@ -1261,10 +1363,8 @@ class Freakos(commands.Bot):
                     channel_name=before.channel.name,
                     server=guild.name,
                 )
-                # Send ONLY into the source VC's own text chat.
                 await _send_to_vc_chat(before.channel, rendered)
 
-        # ---- JOIN event: send to DESTINATION VC's own text chat ----
         if new_id and new_id in watch and after.channel is not None:
             cfg = await self.db.get_json(guild.id, f"vcnotify.cfg.{new_id}", default={})
             if cfg.get("enabled", True):
@@ -1278,19 +1378,16 @@ class Freakos(commands.Bot):
                     channel_name=after.channel.name,
                     server=guild.name,
                 )
-                # Send ONLY into the destination VC's own text chat.
                 await _send_to_vc_chat(after.channel, rendered)
 
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
-        # AutoMod
         try:
             await self._automod_check(message)
         except Exception:
             log.exception("automod error")
 
-        # Custom commands (text prefix: !name)
         if message.content.startswith("!"):
             name = message.content[1:].split(" ", 1)[0].lower()
             row = await self.db.fetchone(
@@ -1316,7 +1413,6 @@ class Freakos(commands.Bot):
 
         await self.process_commands(message)
 
-    # ===== AutoMod =====
     async def _automod_check(self, message: discord.Message):
         guild = message.guild
         if await self.db.get_config(guild.id, "automod.enabled", "0") != "1":
@@ -1337,20 +1433,17 @@ class Freakos(commands.Bot):
         action = settings.get("action", "delete")
         violations = []
 
-        # invites
         if settings.get("invites", True) and re.search(
                 r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+",
                 message.content, re.I):
             violations.append("invite link")
 
-        # links
         if settings.get("links", True) and re.search(
                 r"https?://\S+", message.content, re.I):
             if not re.search(r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+",
                              message.content, re.I):
                 violations.append("link")
 
-        # banned words
         words = settings.get("words", [])
         low = message.content.lower()
         for w in words:
@@ -1358,11 +1451,9 @@ class Freakos(commands.Bot):
                 violations.append(f"banned word `{w}`")
                 break
 
-        # mentions
         if settings.get("mentions", True) and len(message.mentions) >= 5:
             violations.append("mention spam")
 
-        # spam (5 msgs / 5s)
         if settings.get("antispam", True):
             key = (guild.id, message.author.id)
             now = now_utc().timestamp()
@@ -1376,7 +1467,6 @@ class Freakos(commands.Bot):
         if not violations:
             return
 
-        # apply action
         try:
             if action in ("delete", "warn", "timeout", "kick", "ban"):
                 try:
@@ -1421,7 +1511,6 @@ class Freakos(commands.Bot):
         except Exception:
             log.exception("automod action failed")
 
-    # ===== Error handler =====
     async def on_app_command_error(self, interaction: discord.Interaction,
                                    error: app_commands.AppCommandError):
         original = getattr(error, "original", error)
@@ -1464,7 +1553,6 @@ def register_all_commands(bot: Freakos):
     tree = bot.tree
     db = bot.db
 
-    # ---------- helpers ----------
     async def require_admin(interaction: discord.Interaction) -> bool:
         if not interaction.guild:
             await interaction.response.send_message("Guild only.", ephemeral=True)
@@ -1642,35 +1730,54 @@ def register_all_commands(bot: Freakos):
             on_submit=lambda i, v: _save_and_reply(i, "welcome.message", v),
         ))
 
-    @welcome.command(name="embed", description="Set welcome embed (title|color|footer).")
+    @welcome.command(
+        name="embed",
+        description="Configure the welcome embed (used by /welcome test and joins).",
+    )
+    @app_commands.describe(
+        enabled="Turn the welcome embed on or off",
+        title="Embed title (supports placeholders)",
+        color="Hex color like #5865F2",
+        footer="Embed footer (supports placeholders)",
+        image="Large image URL",
+        thumbnail="Small thumbnail URL",
+        author="Author name (supports placeholders)",
+    )
     async def w_embed(interaction: discord.Interaction,
+                      enabled: bool = True,
                       title: Optional[str] = None,
                       color: Optional[str] = None,
-                      footer: Optional[str] = None):
+                      footer: Optional[str] = None,
+                      image: Optional[str] = None,
+                      thumbnail: Optional[str] = None,
+                      author: Optional[str] = None):
         if not await require_admin(interaction): return
-        cfg = {"title": title, "footer": footer}
-        if color:
+        cfg = await db.get_json(interaction.guild.id, "welcome.embed", default={}) or {}
+        cfg["enabled"] = bool(enabled)
+        if title is not None: cfg["title"] = title
+        if footer is not None: cfg["footer"] = footer
+        if image is not None: cfg["image"] = image
+        if thumbnail is not None: cfg["thumbnail"] = thumbnail
+        if author is not None: cfg["author"] = author
+        if color is not None:
             try:
                 cfg["color"] = int(color.replace("#", ""), 16)
             except Exception:
                 pass
         await db.set_json(interaction.guild.id, "welcome.embed", cfg)
-        await interaction.response.send_message("✅ Welcome embed config saved.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Welcome embed config saved (embed mode: {'on' if enabled else 'off'}).",
+            ephemeral=True)
 
-    @welcome.command(name="test", description="Send a test welcome message.")
+    @welcome.command(name="test", description="Send a test welcome using the current configuration.")
     async def w_test(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        ch_id = await db.get_config(interaction.guild.id, "welcome.channel")
-        ch = interaction.guild.get_channel(int(ch_id)) if ch_id else None
-        if not ch:
-            return await interaction.response.send_message("No welcome channel set.", ephemeral=True)
-        tpl = await db.get_config(interaction.guild.id, "welcome.message") or "Welcome {mention}!"
-        rendered = apply_placeholders(
-            tpl, user=interaction.user.name, mention=interaction.user.mention,
-            username=interaction.user.name, display_name=interaction.user.display_name,
-            server=interaction.guild.name, member_count=str(interaction.guild.member_count))
-        for c in chunk_message(rendered):
-            await ch.send(c)
+        if not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+        if not await db.get_config(interaction.guild.id, "welcome.channel"):
+            return await interaction.response.send_message(
+                "No welcome channel set.", ephemeral=True)
+        await _send_welcome_member(bot, interaction.user, force=True)
         await interaction.response.send_message("✅ Test sent.", ephemeral=True)
 
     @welcome.command(name="reset", description="Reset welcome config.")
@@ -1803,7 +1910,7 @@ def register_all_commands(bot: Freakos):
         await db.set_config(interaction.guild.id, "departure.channel", channel.id)
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
-    @departure.command(name="message", description="Set departure message.")
+    @departure.command(name="message", description="Set departure message (supports newlines).")
     async def d_message(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         current = await db.get_config(interaction.guild.id, "departure.message", "") or ""
@@ -1811,27 +1918,61 @@ def register_all_commands(bot: Freakos):
             title="Departure Message", default=current,
             on_submit=lambda i, v: _save_and_reply(i, "departure.message", v)))
 
-    @departure.command(name="test", description="Send a test departure message.")
+    @departure.command(
+        name="embed",
+        description="Configure the departure embed (used by /departure test and leaves).",
+    )
+    @app_commands.describe(
+        enabled="Turn the departure embed on or off",
+        title="Embed title (supports placeholders)",
+        color="Hex color like #5865F2",
+        footer="Embed footer (supports placeholders)",
+        image="Large image URL",
+        thumbnail="Small thumbnail URL",
+        author="Author name (supports placeholders)",
+    )
+    async def d_embed(interaction: discord.Interaction,
+                      enabled: bool = True,
+                      title: Optional[str] = None,
+                      color: Optional[str] = None,
+                      footer: Optional[str] = None,
+                      image: Optional[str] = None,
+                      thumbnail: Optional[str] = None,
+                      author: Optional[str] = None):
+        if not await require_admin(interaction): return
+        cfg = await db.get_json(interaction.guild.id, "departure.embed", default={}) or {}
+        cfg["enabled"] = bool(enabled)
+        if title is not None: cfg["title"] = title
+        if footer is not None: cfg["footer"] = footer
+        if image is not None: cfg["image"] = image
+        if thumbnail is not None: cfg["thumbnail"] = thumbnail
+        if author is not None: cfg["author"] = author
+        if color is not None:
+            try:
+                cfg["color"] = int(color.replace("#", ""), 16)
+            except Exception:
+                pass
+        await db.set_json(interaction.guild.id, "departure.embed", cfg)
+        await interaction.response.send_message(
+            f"✅ Departure embed config saved (embed mode: {'on' if enabled else 'off'}).",
+            ephemeral=True)
+
+    @departure.command(name="test", description="Send a test departure using the current configuration.")
     async def d_test(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        ch_id = await db.get_config(interaction.guild.id, "departure.channel")
-        ch = interaction.guild.get_channel(int(ch_id)) if ch_id else None
-        if not ch:
-            return await interaction.response.send_message("No departure channel set.", ephemeral=True)
-        tpl = await db.get_config(interaction.guild.id, "departure.message") or \
-            "**{user}** left."
-        rendered = apply_placeholders(
-            tpl, user=interaction.user.name, mention=interaction.user.mention,
-            username=interaction.user.name, display_name=interaction.user.display_name,
-            server=interaction.guild.name, member_count=str(interaction.guild.member_count))
-        for c in chunk_message(rendered):
-            await ch.send(c)
+        if not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+        if not await db.get_config(interaction.guild.id, "departure.channel"):
+            return await interaction.response.send_message(
+                "No departure channel set.", ephemeral=True)
+        await _send_departure_member(bot, interaction.user, force=True)
         await interaction.response.send_message("✅ Test sent.", ephemeral=True)
 
     @departure.command(name="reset", description="Reset departure.")
     async def d_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        for k in ("departure.channel", "departure.message", "departure.enabled"):
+        for k in ("departure.channel", "departure.message",
+                  "departure.embed", "departure.enabled"):
             await db.set_config(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
@@ -1907,7 +2048,7 @@ def register_all_commands(bot: Freakos):
             await db.set_config(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
-    # ================= VC NOTIFICATIONS (per-VC own text chat) =================
+    # ================= VC NOTIFICATIONS =================
     vcnotify = app_commands.Group(name="vcnotify", description="VC notifications")
     tree.add_command(vcnotify)
 
@@ -1915,8 +2056,6 @@ def register_all_commands(bot: Freakos):
         return await db.get_json(gid, f"vcnotify.cfg.{vc_id}", default={}) or {}
 
     async def _vc_save_cfg(gid: int, vc_id: int, cfg: dict) -> None:
-        # Drop legacy field so old global-text-channel configs cannot leak
-        # notifications into unrelated channels.
         cfg.pop("target_channel_id", None)
         await db.set_json(gid, f"vcnotify.cfg.{vc_id}", cfg)
 
@@ -2412,7 +2551,7 @@ def register_all_commands(bot: Freakos):
 
     @order.command(name="create", description="Create an order.")
     async def o_create(interaction: discord.Interaction, product_id: int, quantity: int = 1):
-        await sh_buy.callback(interaction, product_id, quantity)  # reuse
+        await sh_buy.callback(interaction, product_id, quantity)
 
     @order.command(name="list", description="List orders.")
     async def o_list(interaction: discord.Interaction):
@@ -2923,7 +3062,6 @@ def register_all_commands(bot: Freakos):
                                              description=p["description"] or None), view=view)
         await db.execute("UPDATE reaction_panels SET message_id=?, channel_id=? WHERE id=?",
                          (msg.id, ch.id, panel_id))
-        # ensure the persistent view is registered
         bot.add_view(view, message_id=msg.id)
         await interaction.response.send_message("✅ Panel posted.", ephemeral=True)
 
