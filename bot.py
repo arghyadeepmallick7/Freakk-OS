@@ -310,32 +310,61 @@ class TicketCreateButton(discord.ui.View):
         view.add_item(select)
         await interaction.response.send_message('Choose a ticket type to open:', view=view, ephemeral=True)
 class TicketManageView(discord.ui.View):
-    """Buttons inside a ticket channel."""
-    def __init__(self, ticket_id: int): super().__init__(timeout=None); self.ticket_id = ticket_id
-    @discord.ui.button(label='Claim', style=discord.ButtonStyle.success, custom_id=f'freakos:ticket:claim:{ticket_id}')
-    async def claim(self, interaction: discord.Interaction, _):
-        row = await interaction.client.db.fetchone('SELECT * FROM tickets WHERE id=?', (self.ticket_id,))
+    """Persistent ticket controls with unique IDs per ticket."""
+    def __init__(self, ticket_id: int):
+        super().__init__(timeout=None)
+        self.ticket_id = ticket_id
+
+        claim = discord.ui.Button(
+            label="Claim", style=discord.ButtonStyle.success,
+            custom_id=f"freakos:ticket:claim:{ticket_id}"
+        )
+        close = discord.ui.Button(
+            label="Close", style=discord.ButtonStyle.secondary,
+            custom_id=f"freakos:ticket:close:{ticket_id}"
+        )
+        claim.callback = self._claim
+        close.callback = self._close
+        self.add_item(claim)
+        self.add_item(close)
+
+    async def _claim(self, interaction: discord.Interaction):
+        row = await interaction.client.db.fetchone(
+            "SELECT * FROM tickets WHERE id=?", (self.ticket_id,)
+        )
         if not row:
-            return await interaction.response.send_message('Ticket not found.', ephemeral=True)
+            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
         if not is_admin_or_mod(interaction.user):
-            return await interaction.response.send_message('Staff only.', ephemeral=True)
-        await interaction.client.db.execute('UPDATE tickets SET claimed_by=? WHERE id=?', (interaction.user.id, self.ticket_id))
-        await interaction.response.send_message(f'✅ Claimed by {interaction.user.mention}')
-    @discord.ui.button(label='Close', style=discord.ButtonStyle.secondary, custom_id=f'freakos:ticket:close:{ticket_id}')
-    async def close(self, interaction: discord.Interaction, _):
-        row = await interaction.client.db.fetchone('SELECT * FROM tickets WHERE id=?', (self.ticket_id,))
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        await interaction.client.db.execute(
+            "UPDATE tickets SET claimed_by=? WHERE id=?",
+            (interaction.user.id, self.ticket_id)
+        )
+        await interaction.response.send_message(
+            f"Claimed by {interaction.user.mention}"
+        )
+
+    async def _close(self, interaction: discord.Interaction):
+        row = await interaction.client.db.fetchone(
+            "SELECT * FROM tickets WHERE id=?", (self.ticket_id,)
+        )
         if not row:
-            return await interaction.response.send_message('Ticket not found.', ephemeral=True)
-        if interaction.user.id != row['user_id'] and (not is_admin_or_mod(interaction.user)):
-            return await interaction.response.send_message('Not allowed.', ephemeral=True)
-        await interaction.client.db.execute("UPDATE tickets SET status='closed' WHERE id=?", (self.ticket_id,))
+            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
+        if interaction.user.id != row["user_id"] and not is_admin_or_mod(interaction.user):
+            return await interaction.response.send_message("Not allowed.", ephemeral=True)
+        await interaction.client.db.execute(
+            "UPDATE tickets SET status='closed' WHERE id=?", (self.ticket_id,)
+        )
         try:
             ow = interaction.channel.overwrites_for(interaction.guild.default_role)
             ow.send_messages = False
-            await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
+            await interaction.channel.set_permissions(
+                interaction.guild.default_role, overwrite=ow
+            )
         except Exception:
             pass
-        await interaction.response.send_message('🔒 Ticket closed.')
+        await interaction.response.send_message("Ticket closed.")
+
 async def _open_ticket(interaction: discord.Interaction, ttype: str):
     guild = interaction.guild
     if not guild:
