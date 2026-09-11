@@ -915,61 +915,26 @@ async def _log_guild(bot: "Freakos", guild: discord.Guild, event_key: str,
 # =====================================================================
 
 async def _run_ticket_autodelete(bot: "Freakos", payload: dict):
-    """Scheduled task: delete a ticket channel that has been closed for the configured time."""
+    """Delete a ticket channel that has been closed for the configured time."""
     tid = payload.get("ticket_id")
     if not tid:
         return
     row = await bot.db.fetchone("SELECT * FROM tickets WHERE id=?", (tid,))
     if not row:
         return
-    # Only auto-delete if it's still closed (user may have reopened)
     if row["status"] != "closed":
         return
     guild = bot.get_guild(row["guild_id"])
     if not guild:
         return
     channel = guild.get_channel(row["channel_id"])
-
     if channel:
-        # Optional transcript dump
-        try:
-            transcript_chan_id = await bot.db.get_config(guild.id, "ticket.transcript_channel")
-            if transcript_chan_id:
-                tchan = guild.get_channel(int(transcript_chan_id))
-                if tchan:
-                    lines = []
-                    async for m in channel.history(limit=1000, oldest_first=True):
-                        content = m.content or ""
-                        if m.embeds:
-                            for e in m.embeds:
-                                if e.title:
-                                    content += f"\n[embed] {e.title}"
-                                if e.description:
-                                    content += f"\n[embed] {e.description[:200]}"
-                        if m.attachments:
-                            for a in m.attachments:
-                                content += f"\n[attachment] {a.url}"
-                        lines.append(f"[{fmt_dt(m.created_at)}] {m.author}:")
-                        for l in (content or "(no content)").split("\n"):
-                            lines.append(f"    {l}")
-                        lines.append("")
-                    text = "\n".join(lines) or "(empty)"
-                    import io
-                    buf = io.BytesIO(text.encode("utf-8"))
-                    await tchan.send(
-                        f"📄 Auto-delete transcript — Ticket #{tid}",
-                        file=discord.File(buf, filename=f"ticket-{tid}.txt"),
-                    )
-        except Exception:
-            log.exception("Autodelete transcript failed for ticket %s", tid)
-
         try:
             await channel.send("🗑 This ticket will be auto-deleted in a moment…")
             await asyncio.sleep(3)
             await channel.delete(reason="Ticket auto-deleted (was closed)")
         except Exception:
             log.exception("Autodelete channel deletion failed for ticket %s", tid)
-
     await bot.db.execute("DELETE FROM tickets WHERE id=?", (tid,))
     await _log_guild(bot, guild, "tickets", "Ticket Auto-Deleted",
                      f"Ticket `#{tid}` auto-deleted after being closed.")
@@ -2418,7 +2383,7 @@ def register_all_commands(bot: Freakos):
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
     @ticket.command(name="autodelete",
-                    description="Auto-delete ticket channels X time after they're closed. Use 0 to disable.")
+                    description="Auto-delete ticket channels X time after being closed. Use 0 to disable.")
     @app_commands.describe(duration="e.g. 10m, 1h, 2d, or 0 to disable")
     async def t_autodelete(interaction: discord.Interaction, duration: str):
         if not await require_admin(interaction): return
