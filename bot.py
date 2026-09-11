@@ -112,7 +112,6 @@ def chunk_message(text: str, limit: int = 1990) -> list[str]:
     chunks: list[str] = []
     cur = ""
     for line in text.split("\n"):
-        # Hard-split extremely long single lines
         while len(line) > limit:
             if cur:
                 chunks.append(cur)
@@ -375,7 +374,6 @@ class Database:
             cur = await self.conn.execute(sql, params)
             return await cur.fetchall()
 
-    # ---- config helpers ----
     async def get_config(self, guild_id: int, key: str, default=None):
         row = await self.fetchone(
             "SELECT value FROM guild_config WHERE guild_id=? AND key=?",
@@ -562,8 +560,6 @@ class TicketCreateButton(discord.ui.View):
 
 
 class TicketPanelModal(discord.ui.Modal, title="Ticket Panel"):
-    """Collects the panel title/description as real multi-line text (Shift+Enter works here,
-    unlike a slash-command string option, which is always a single line)."""
     panel_title = discord.ui.TextInput(
         label="Title",
         style=discord.TextStyle.short,
@@ -650,7 +646,6 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
     if not row:
         return await interaction.response.send_message("Type not found.", ephemeral=True)
 
-    # limit & cooldown
     limit = int(await db.get_config(guild.id, "ticket.limit", "1") or 1)
     open_count = await db.fetchone(
         "SELECT COUNT(*) c FROM tickets WHERE guild_id=? AND user_id=? AND status='open'",
@@ -723,7 +718,6 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
         pass
     await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
 
-    # logging
     await _log_guild(interaction.client, guild, "tickets", "Ticket Opened",
                      f"{interaction.user.mention} opened `{ttype}` → {channel.mention}")
 
@@ -821,7 +815,6 @@ class GiveawayView(discord.ui.View):
         await interaction.response.send_message("✅ Entered!", ephemeral=True)
 
 
-# Shop/buy uses modals dynamically; no persistent view needed beyond panels
 class ShopPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -928,11 +921,9 @@ async def _run_timeout_end(bot: "Freakos", payload: dict):
         return
     member = guild.get_member(row["user_id"])
     if member:
-        # Only send if user was actually timed out and now isn't
         try:
             until = member.timed_out_until
             if until and until > now_utc():
-                # still timed out, re-schedule
                 await bot.scheduler.schedule(
                     "timeout_end",
                     until + timedelta(seconds=5),
@@ -1051,10 +1042,9 @@ class Freakos(commands.Bot):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.db = Database(DB_PATH)
         self.scheduler: Optional[Scheduler] = None
-        self._vc_cache: dict[int, int] = {}  # user_id -> channel_id (in memory for dedupe)
+        self._vc_cache: dict[int, int] = {}
         self._spam_tracker: dict[tuple, list[float]] = {}
 
-    # ---------- lifecycle ----------
     async def setup_hook(self):
         await self.db.connect()
         self.scheduler = Scheduler(self)
@@ -1064,18 +1054,14 @@ class Freakos(commands.Bot):
         await self._restore_scheduled_tasks()
 
     async def _restore_persistent_views(self):
-        # Ticket panel
         self.add_view(TicketCreateButton())
         self.add_view(ShopPanelView())
-        # Ticket manage views: readd per open ticket
         rows = await self.db.fetchall("SELECT id FROM tickets WHERE status='open'")
         for r in rows:
             self.add_view(TicketManageView(r["id"]))
-        # Giveaways
         gws = await self.db.fetchall("SELECT id FROM giveaways WHERE ended=0")
         for g in gws:
             self.add_view(GiveawayView(g["id"]))
-        # Reaction role panels
         panels = await self.db.fetchall("SELECT * FROM reaction_panels")
         for p in panels:
             roles = await self.db.fetchall(
@@ -1110,7 +1096,6 @@ class Freakos(commands.Bot):
         except Exception:
             pass
 
-    # ===== Task dispatch handlers (called by Scheduler) =====
     async def task_timeout_end(self, payload: dict):
         await _run_timeout_end(self, payload)
 
@@ -1120,10 +1105,8 @@ class Freakos(commands.Bot):
     async def task_announcement(self, payload: dict):
         await _run_announcement(self, payload)
 
-    # ===== Events =====
     async def on_member_join(self, member: discord.Member):
         guild = member.guild
-        # Welcome
         enabled = await self.db.get_config(guild.id, "welcome.enabled", "0")
         if enabled == "1":
             ch_id = await self.db.get_config(guild.id, "welcome.channel")
@@ -1145,7 +1128,6 @@ class Freakos(commands.Bot):
                         await ch.send(c)
                 except Exception:
                     pass
-        # Autorole
         if await self.db.get_config(guild.id, "autorole.enabled", "0") == "1":
             roles = await self.db.get_json(guild.id, "autorole.roles", default=[])
             good = []
@@ -1158,7 +1140,6 @@ class Freakos(commands.Bot):
                     await member.add_roles(*good, reason="Autorole")
                 except Exception:
                     log.exception("Autorole failed")
-        # Autonick
         if await self.db.get_config(guild.id, "autonick.enabled", "0") == "1":
             fmt = await self.db.get_config(guild.id, "autonick.format") or "{user}"
             nick = apply_placeholders(
@@ -1171,7 +1152,6 @@ class Freakos(commands.Bot):
                     await member.edit(nick=nick, reason="Autonick")
             except Exception:
                 pass
-        # Logging
         await _log_guild(self, guild, "joins", "Member Joined",
                          f"{member.mention} ({member})")
 
@@ -1225,7 +1205,6 @@ class Freakos(commands.Bot):
         new_id = new_ch.id if new_ch else None
         if old_id == new_id:
             return
-        # cache last known VC (kept for parity; safe to ignore)
         self._vc_cache[member.id] = new_id or 0
 
         # Global toggle. Default ON so pre-existing setups keep firing.
@@ -1235,7 +1214,6 @@ class Freakos(commands.Bot):
         watch = await self.db.get_json(guild.id, "vcnotify.channels", default=[])
         if not watch:
             return
-        # Normalise to ints — JSON round-trips can hand back strings on old rows
         try:
             watch_ids = {int(c) for c in watch}
         except (TypeError, ValueError):
@@ -1292,13 +1270,11 @@ class Freakos(commands.Bot):
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
-        # AutoMod
         try:
             await self._automod_check(message)
         except Exception:
             log.exception("automod error")
 
-        # Custom commands (text prefix: !name)
         if message.content.startswith("!"):
             name = message.content[1:].split(" ", 1)[0].lower()
             row = await self.db.fetchone(
@@ -1324,7 +1300,6 @@ class Freakos(commands.Bot):
 
         await self.process_commands(message)
 
-    # ===== AutoMod =====
     async def _automod_check(self, message: discord.Message):
         guild = message.guild
         if await self.db.get_config(guild.id, "automod.enabled", "0") != "1":
@@ -1345,20 +1320,17 @@ class Freakos(commands.Bot):
         action = settings.get("action", "delete")
         violations = []
 
-        # invites
         if settings.get("invites", True) and re.search(
                 r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+",
                 message.content, re.I):
             violations.append("invite link")
 
-        # links
         if settings.get("links", True) and re.search(
                 r"https?://\S+", message.content, re.I):
             if not re.search(r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+",
                              message.content, re.I):
                 violations.append("link")
 
-        # banned words
         words = settings.get("words", [])
         low = message.content.lower()
         for w in words:
@@ -1366,11 +1338,9 @@ class Freakos(commands.Bot):
                 violations.append(f"banned word `{w}`")
                 break
 
-        # mentions
         if settings.get("mentions", True) and len(message.mentions) >= 5:
             violations.append("mention spam")
 
-        # spam (5 msgs / 5s)
         if settings.get("antispam", True):
             key = (guild.id, message.author.id)
             now = now_utc().timestamp()
@@ -1384,7 +1354,6 @@ class Freakos(commands.Bot):
         if not violations:
             return
 
-        # apply action
         try:
             if action in ("delete", "warn", "timeout", "kick", "ban"):
                 try:
@@ -1429,7 +1398,6 @@ class Freakos(commands.Bot):
         except Exception:
             log.exception("automod action failed")
 
-    # ===== Error handler =====
     async def on_app_command_error(self, interaction: discord.Interaction,
                                    error: app_commands.AppCommandError):
         original = getattr(error, "original", error)
@@ -1472,7 +1440,6 @@ def register_all_commands(bot: Freakos):
     tree = bot.tree
     db = bot.db
 
-    # ---------- helpers ----------
     async def require_admin(interaction: discord.Interaction) -> bool:
         if not interaction.guild:
             await interaction.response.send_message("Guild only.", ephemeral=True)
@@ -1567,8 +1534,6 @@ def register_all_commands(bot: Freakos):
             return
         g = interaction.guild
         lines = []
-        def status(key, default="off"):
-            return "🟢" if default == "on" else "⚪"
         checks = [
             ("Welcome", await db.get_config(g.id, "welcome.enabled", "0") == "1"),
             ("Autorole", await db.get_config(g.id, "autorole.enabled", "0") == "1"),
@@ -1950,7 +1915,6 @@ def register_all_commands(bot: Freakos):
             watched.append(voice_channel.id)
             await _vc_set_watched(interaction.guild.id, watched)
 
-        # Auto-enable the feature globally so setup actually starts working.
         await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
 
         await interaction.response.send_message(
@@ -1993,7 +1957,6 @@ def register_all_commands(bot: Freakos):
         watched = await _vc_watched(interaction.guild.id)
         watched = [c for c in watched if c != voice_channel.id]
         await _vc_set_watched(interaction.guild.id, watched)
-        # Clean up the orphaned per-channel config entry
         await db.set_config(interaction.guild.id, f"vcnotify.cfg.{voice_channel.id}", None)
         await interaction.response.send_message(
             f"✅ Stopped watching {voice_channel.mention}.", ephemeral=True
@@ -2338,8 +2301,7 @@ def register_all_commands(bot: Freakos):
         if ch_id:
             ch = interaction.guild.get_channel(int(ch_id))
             if ch:
-                e = make_embed(title="⭐ New Vouch",
-                               description=comment)
+                e = make_embed(title="⭐ New Vouch", description=comment)
                 e.add_field(name="User", value=user.mention, inline=True)
                 e.add_field(name="From", value=interaction.user.mention, inline=True)
                 try:
@@ -2505,7 +2467,7 @@ def register_all_commands(bot: Freakos):
 
     @order.command(name="create", description="Create an order.")
     async def o_create(interaction: discord.Interaction, product_id: int, quantity: int = 1):
-        await sh_buy.callback(interaction, product_id, quantity)  # reuse
+        await sh_buy.callback(interaction, product_id, quantity)
 
     @order.command(name="list", description="List orders.")
     async def o_list(interaction: discord.Interaction):
@@ -2993,21 +2955,4 @@ def register_all_commands(bot: Freakos):
         if mode not in ("button", "select"):
             return await interaction.response.send_message("mode must be `button` or `select`.", ephemeral=True)
         pid = await db.execute(
-            "INSERT INTO reaction_panels (guild_id, channel_id, title, description, mode) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (interaction.guild.id, interaction.channel.id, title, description, mode))
-        await interaction.response.send_message(
-            f"✅ Panel `#{pid}` created. Use `/reactionrole add panel_id:{pid} role:@role`.",
-            ephemeral=True)
-
-    @rr.command(name="create", description="Post an existing panel.")
-    async def rr_create(interaction: discord.Interaction, panel_id: int,
-                        channel: Optional[discord.TextChannel] = None):
-        if not await require_admin(interaction): return
-        p = await db.fetchone("SELECT * FROM reaction_panels WHERE id=? AND guild_id=?",
-                              (panel_id, interaction.guild.id))
-        if not p:
-            return await interaction.response.send_message("Panel not found.", ephemeral=True)
-        roles = await db.fetchall(
-            "SELECT role_id, label, emoji FROM reaction_roles WHERE panel_id=?", (panel_id,))
-        view = ReactionRoleView(panel_id, [
+            "INSERT INTO reaction_panels (guild_id, channel_id, title, description, mode
