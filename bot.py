@@ -561,6 +561,37 @@ class TicketCreateButton(discord.ui.View):
         )
 
 
+class TicketPanelModal(discord.ui.Modal, title="Ticket Panel"):
+    """Collects the panel title/description as real multi-line text (Shift+Enter works here,
+    unlike a slash-command string option, which is always a single line)."""
+    panel_title = discord.ui.TextInput(
+        label="Title",
+        style=discord.TextStyle.short,
+        max_length=256,
+        required=False,
+    )
+    panel_description = discord.ui.TextInput(
+        label="Description",
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+        required=False,
+    )
+
+    def __init__(self, channel: discord.TextChannel):
+        super().__init__()
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = make_embed(
+            title=self.panel_title.value or None,
+            description=self.panel_description.value or None,
+        )
+        await self.channel.send(embed=embed, view=TicketCreateButton())
+        await interaction.response.send_message(
+            f"✅ Panel posted in {self.channel.mention}.", ephemeral=True
+        )
+
+
 class TicketManageView(discord.ui.View):
     """Buttons inside a ticket channel."""
     def __init__(self, ticket_id: int):
@@ -680,10 +711,10 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
         (guild.id, channel.id, interaction.user.id, ttype, iso(now_utc())),
     )
 
-    body = (row["message"] or (
-        f"Hey {interaction.user.mention}, thanks for opening a **{ttype}** ticket!\\n\\n"
+    body = row["message"] or (
+        f"Hey {interaction.user.mention}, thanks for opening a **{ttype}** ticket!\n\n"
         "Support will be with you shortly. Please describe your issue."
-    )).replace("\\n", "\n")
+    )
     embed = make_embed(title=f"Ticket #{tid} — {ttype}", description=body)
     view = TicketManageView(tid)
     try:
@@ -1978,35 +2009,50 @@ def register_all_commands(bot: Freakos):
             "Use `/ticket type` to add a ticket type, then `/ticket panel` to place the panel.",
             ephemeral=True)
 
-    @ticket.command(name="panel", description="Post the ticket panel.")
+    @ticket.command(name="panel", description="Post the ticket panel (opens a form for multi-line text).")
     async def t_panel(interaction: discord.Interaction,
-                      channel: Optional[discord.TextChannel] = None,
-                      title: Optional[str] = None,
-                      description: Optional[str] = None):
+                      channel: Optional[discord.TextChannel] = None):
         if not await require_admin(interaction): return
         ch = channel or interaction.channel
-        embed = make_embed(title=title or "🎫 Support Tickets",
-                           description=description or "Click the button below to open a ticket.")
-        await ch.send(embed=embed, view=TicketCreateButton())
-        await interaction.response.send_message(f"✅ Panel posted in {ch.mention}.", ephemeral=True)
+        await interaction.response.send_modal(TicketPanelModal(ch))
 
     @ticket.command(name="type", description="Add or update a ticket type.")
     @app_commands.describe(name="Name", category="Category", support_role="Support role",
-                           emoji="Optional emoji", message="Intro message (optional)")
+                           emoji="Optional emoji")
     async def t_type(interaction: discord.Interaction, name: str,
                      category: discord.CategoryChannel,
                      support_role: discord.Role,
-                     emoji: Optional[str] = None,
-                     message: Optional[str] = None):
+                     emoji: Optional[str] = None):
         if not await require_admin(interaction): return
         await db.execute(
-            "INSERT INTO ticket_types (guild_id, name, emoji, category_id, support_role_id, message) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO ticket_types (guild_id, name, emoji, category_id, support_role_id) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(guild_id, name) DO UPDATE SET "
             "emoji=excluded.emoji, category_id=excluded.category_id, "
-            "support_role_id=excluded.support_role_id, message=excluded.message",
-            (interaction.guild.id, name, emoji, category.id, support_role.id, message))
-        await interaction.response.send_message(f"✅ Ticket type `{name}` saved.", ephemeral=True)
+            "support_role_id=excluded.support_role_id",
+            (interaction.guild.id, name, emoji, category.id, support_role.id))
+        await interaction.response.send_message(
+            f"✅ Ticket type `{name}` saved. Use `/ticket message name:{name}` to set its intro message.",
+            ephemeral=True)
+
+    @ticket.command(name="message", description="Set a ticket type's intro message (supports multi-line text).")
+    async def t_message(interaction: discord.Interaction, name: str):
+        if not await require_admin(interaction): return
+        row = await db.fetchone(
+            "SELECT * FROM ticket_types WHERE guild_id=? AND name=?",
+            (interaction.guild.id, name))
+        if not row:
+            return await interaction.response.send_message("Ticket type not found.", ephemeral=True)
+        current = row["message"] or ""
+
+        async def save(i: discord.Interaction, v: str):
+            await db.execute(
+                "UPDATE ticket_types SET message=? WHERE guild_id=? AND name=?",
+                (v, i.guild.id, name))
+            await i.response.send_message("✅ Saved.", ephemeral=True)
+
+        await interaction.response.send_modal(TextModal(
+            title=f"{name} — Intro Message"[:45], default=current, on_submit=save))
 
     @ticket.command(name="category", description="Update a type's category.")
     async def t_category(interaction: discord.Interaction, name: str,
