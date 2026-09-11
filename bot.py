@@ -103,33 +103,6 @@ def apply_placeholders(text: str, **kw: Any) -> str:
     return out
 
 
-def normalize_ticket_text(text: Optional[str]) -> str:
-    """
-    Central helper for ALL ticket text rendering.
-
-    Guarantees:
-      - Real newlines are preserved.
-      - Blank lines / paragraphs / indentation are preserved.
-      - Literal "\\n" (backslash + n, two chars) is converted to a real newline.
-      - CRLF / CR are normalised to LF.
-      - NEVER calls .strip() or collapses runs of whitespace.
-      - NEVER replaces multiple newlines with one.
-
-    Use this everywhere ticket text is rendered. Future ticket text fields
-    should route through this helper so multiline formatting is consistent.
-    """
-    if text is None:
-        return ""
-    if not isinstance(text, str):
-        text = str(text)
-    # Normalise line endings first (CRLF / CR -> LF)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Convert literal backslash-n sequences into real newlines
-    text = text.replace("\\n", "\n")
-    # Do NOT strip, do NOT collapse, do NOT touch indentation
-    return text
-
-
 def chunk_message(text: str, limit: int = 1990) -> list[str]:
     """Split a message into <=limit chunks without destroying newlines."""
     if text is None:
@@ -263,16 +236,6 @@ CREATE TABLE IF NOT EXISTS ticket_types (
     support_role_id INTEGER,
     message TEXT,
     UNIQUE(guild_id, name)
-);
-CREATE TABLE IF NOT EXISTS ticket_panels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id INTEGER NOT NULL,
-    channel_id INTEGER NOT NULL,
-    message_id INTEGER,
-    title TEXT,
-    description TEXT,
-    color INTEGER,
-    created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS vouches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -558,12 +521,7 @@ def build_embed_from_config(cfg: dict, defaults: discord.Embed) -> discord.Embed
 # =====================================================================
 
 class TicketCreateButton(discord.ui.View):
-    """
-    LEGACY persistent 'Open Ticket' button that shows a type select on click.
-
-    Kept intentionally for backwards compatibility with old panels already
-    posted using this view. New panels use TicketPanelView instead.
-    """
+    """Persistent 'Open Ticket' button that shows a type select on click."""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -649,75 +607,19 @@ class TicketManageView(discord.ui.View):
         await interaction.response.send_message("🔒 Ticket closed.")
 
 
-class TicketPanelView(discord.ui.View):
-    """
-    NEW persistent panel: one PRIMARY button per configured ticket type.
-    Buttons call _open_ticket_by_id immediately — no select menu, no second click.
-
-    custom_id format:  freakos:ticket:type:<ticket_types.id>
-
-    Discord limits: 5 buttons per row, 5 rows = 25 buttons total.
-    discord.py auto-wraps buttons into rows of five, so five types naturally
-    fit on one row and more types wrap automatically.
-    """
-    MAX_BUTTONS = 25
-
-    def __init__(self, buttons_data: list[dict]):
-        super().__init__(timeout=None)
-
-        # Sort by id for stable ordering, cap at Discord limit
-        buttons_data = sorted(buttons_data, key=lambda b: b["id"])[: self.MAX_BUTTONS]
-
-        for b in buttons_data:
-            raw_label = str(b.get("name") or f"Type {b['id']}")
-            label = raw_label[:80] if raw_label else f"Type {b['id']}"
-            emoji = (b.get("emoji") or None)
-            try:
-                btn = discord.ui.Button(
-                    label=label,
-                    emoji=emoji,
-                    style=discord.ButtonStyle.primary,
-                    custom_id=f"freakos:ticket:type:{b['id']}",
-                )
-            except Exception:
-                # Bad emoji -> retry without it
-                btn = discord.ui.Button(
-                    label=label,
-                    style=discord.ButtonStyle.primary,
-                    custom_id=f"freakos:ticket:type:{b['id']}",
-                )
-            btn.callback = self._make_callback(b["id"])
-            self.add_item(btn)
-
-    def _make_callback(self, type_id: int):
-        async def cb(interaction: discord.Interaction):
-            await _open_ticket_by_id(interaction, type_id)
-        return cb
-
-
-async def _open_ticket_internal(interaction: discord.Interaction,
-                                row: "aiosqlite.Row") -> None:
-    """
-    Shared ticket-creation engine. `row` is a ticket_types row.
-
-    Preserves every existing ticket feature:
-      - ticket limit per user
-      - cooldown
-      - category assignment
-      - support-role permission overwrite
-      - private channel permissions
-      - ticket number
-      - multiline opening message (normalized through normalize_ticket_text)
-      - Claim + Close buttons
-      - ticket logging
-    """
+async def _open_ticket(interaction: discord.Interaction, ttype: str):
     guild = interaction.guild
     if not guild:
         return
     db: Database = interaction.client.db
-    ttype = row["name"]
+    row = await db.fetchone(
+        "SELECT * FROM ticket_types WHERE guild_id=? AND name=?",
+        (guild.id, ttype),
+    )
+    if not row:
+        return await interaction.response.send_message("Type not found.", ephemeral=True)
 
-    # --- limit ---
+    # limit & cooldown
     limit = int(await db.get_config(guild.id, "ticket.limit", "1") or 1)
     open_count = await db.fetchone(
         "SELECT COUNT(*) c FROM tickets WHERE guild_id=? AND user_id=? AND status='open'",
@@ -728,7 +630,6 @@ async def _open_ticket_internal(interaction: discord.Interaction,
             f"You already have {open_count['c']} open ticket(s).", ephemeral=True
         )
 
-    # --- cooldown ---
     cooldown = int(await db.get_config(guild.id, "ticket.cooldown", "0") or 0)
     if cooldown > 0:
         last = await db.fetchone(
@@ -750,12 +651,10 @@ async def _open_ticket_internal(interaction: discord.Interaction,
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         interaction.user: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True,
-            attach_files=True, read_message_history=True,
+            view_channel=True, send_messages=True, attach_files=True, read_message_history=True
         ),
         guild.me: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True,
-            manage_channels=True, manage_permissions=True,
+            view_channel=True, send_messages=True, manage_channels=True, manage_permissions=True
         ),
     }
     if support_role:
@@ -781,113 +680,21 @@ async def _open_ticket_internal(interaction: discord.Interaction,
         (guild.id, channel.id, interaction.user.id, ttype, iso(now_utc())),
     )
 
-    # ---- MULTILINE BODY (the whole point of this redesign) ----
-    raw_body = normalize_ticket_text(row["message"]) if row["message"] else ""
-    if not raw_body:
-        raw_body = (
-            f"Hey {interaction.user.mention}, thanks for opening a **{ttype}** ticket!\n\n"
-            "Support will be with you shortly. Please describe your issue."
-        )
-    else:
-        raw_body = apply_placeholders(
-            raw_body,
-            user=interaction.user.mention,
-            mention=interaction.user.mention,
-            username=interaction.user.name,
-            display_name=interaction.user.display_name,
-            server=guild.name,
-            ticket_id=str(tid),
-            type=ttype,
-        )
-
-    embed = make_embed(title=f"Ticket #{tid} — {ttype}", description=raw_body)
+    body = (row["message"] or (
+        f"Hey {interaction.user.mention}, thanks for opening a **{ttype}** ticket!\\n\\n"
+        "Support will be with you shortly. Please describe your issue."
+    )).replace("\\n", "\n")
+    embed = make_embed(title=f"Ticket #{tid} — {ttype}", description=body)
     view = TicketManageView(tid)
     try:
         await channel.send(content=interaction.user.mention, embed=embed, view=view)
     except Exception:
-        log.exception("Failed to send ticket opener")
+        pass
+    await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
 
-    await interaction.response.send_message(
-        f"✅ Ticket created: {channel.mention}", ephemeral=True
-    )
-
+    # logging
     await _log_guild(interaction.client, guild, "tickets", "Ticket Opened",
                      f"{interaction.user.mention} opened `{ttype}` → {channel.mention}")
-
-
-async def _open_ticket(interaction: discord.Interaction, ttype: str):
-    """LEGACY: open ticket by type NAME (used by old Open-Ticket view)."""
-    guild = interaction.guild
-    if not guild:
-        return
-    row = await interaction.client.db.fetchone(
-        "SELECT * FROM ticket_types WHERE guild_id=? AND name=?",
-        (guild.id, ttype),
-    )
-    if not row:
-        return await interaction.response.send_message(
-            "Type not found.", ephemeral=True
-        )
-    await _open_ticket_internal(interaction, row)
-
-
-async def _open_ticket_by_id(interaction: discord.Interaction, type_id: int):
-    """NEW: open ticket by ticket_types.id (used by direct panel buttons)."""
-    guild = interaction.guild
-    if not guild:
-        return
-    row = await interaction.client.db.fetchone(
-        "SELECT * FROM ticket_types WHERE id=? AND guild_id=?",
-        (type_id, guild.id),
-    )
-    if not row:
-        return await interaction.response.send_message(
-            "This ticket type no longer exists. Ask an admin to repost the panel.",
-            ephemeral=True,
-        )
-    await _open_ticket_internal(interaction, row)
-
-
-async def _reregister_ticket_panel_views(bot: "Freakos",
-                                         guild_id: Optional[int] = None):
-    """
-    (Re)register persistent TicketPanelView instances so that all current
-    ticket-type buttons remain dispatchable after:
-      - bot restart
-      - host restart
-      - reconnect
-      - deployment
-      - runtime addition/removal of ticket types
-
-    discord.py keys persistent views by custom_id, so re-registering with
-    fresh instances safely overwrites prior global registrations.
-    """
-    if guild_id is None:
-        rows = await bot.db.fetchall(
-            "SELECT id, guild_id, name, emoji FROM ticket_types ORDER BY guild_id, id"
-        )
-        by_guild: dict[int, list[dict]] = {}
-        for r in rows:
-            by_guild.setdefault(r["guild_id"], []).append(dict(r))
-        for _gid, buttons in by_guild.items():
-            try:
-                bot.add_view(TicketPanelView(buttons))
-            except Exception:
-                log.exception("Failed to register panel view for guild %s", _gid)
-        return
-
-    rows = await bot.db.fetchall(
-        "SELECT id, guild_id, name, emoji FROM ticket_types "
-        "WHERE guild_id=? ORDER BY id",
-        (guild_id,),
-    )
-    buttons = [dict(r) for r in rows]
-    if not buttons:
-        return
-    try:
-        bot.add_view(TicketPanelView(buttons))
-    except Exception:
-        log.exception("Failed to register panel view for guild %s", guild_id)
 
 
 class ReactionRoleView(discord.ui.View):
@@ -1226,32 +1033,18 @@ class Freakos(commands.Bot):
         await self._restore_scheduled_tasks()
 
     async def _restore_persistent_views(self):
-        # ---- TICKET PANELS (new direct-button design) ----
-        # Rehydrate one TicketPanelView per guild so every configured
-        # ticket-type button keeps working after restart / redeploy.
-        await _reregister_ticket_panel_views(self, None)
-
-        # ---- LEGACY "Open Ticket" button (kept for old panels) ----
+        # Ticket panel
         self.add_view(TicketCreateButton())
-
-        # ---- SHOP ----
         self.add_view(ShopPanelView())
-
-        # ---- TICKET MANAGE VIEWS (per open ticket) ----
-        rows = await self.db.fetchall(
-            "SELECT id FROM tickets WHERE status='open'"
-        )
+        # Ticket manage views: readd per open ticket
+        rows = await self.db.fetchall("SELECT id FROM tickets WHERE status='open'")
         for r in rows:
             self.add_view(TicketManageView(r["id"]))
-
-        # ---- GIVEAWAYS ----
-        gws = await self.db.fetchall(
-            "SELECT id FROM giveaways WHERE ended=0"
-        )
+        # Giveaways
+        gws = await self.db.fetchall("SELECT id FROM giveaways WHERE ended=0")
         for g in gws:
             self.add_view(GiveawayView(g["id"]))
-
-        # ---- REACTION ROLE PANELS ----
+        # Reaction role panels
         panels = await self.db.fetchall("SELECT * FROM reaction_panels")
         for p in panels:
             roles = await self.db.fetchall(
@@ -2185,145 +1978,35 @@ def register_all_commands(bot: Freakos):
             "Use `/ticket type` to add a ticket type, then `/ticket panel` to place the panel.",
             ephemeral=True)
 
-    @ticket.command(name="panel",
-                    description="Post a ticket panel (opens a multiline modal editor).")
-    @app_commands.describe(channel="Channel to post the panel in (defaults to current)")
+    @ticket.command(name="panel", description="Post the ticket panel.")
     async def t_panel(interaction: discord.Interaction,
-                      channel: Optional[discord.TextChannel] = None):
-        if not await require_admin(interaction):
-            return
+                      channel: Optional[discord.TextChannel] = None,
+                      title: Optional[str] = None,
+                      description: Optional[str] = None):
+        if not await require_admin(interaction): return
         ch = channel or interaction.channel
+        embed = make_embed(title=title or "🎫 Support Tickets",
+                           description=description or "Click the button below to open a ticket.")
+        await ch.send(embed=embed, view=TicketCreateButton())
+        await interaction.response.send_message(f"✅ Panel posted in {ch.mention}.", ephemeral=True)
 
-        async def save_panel(i: discord.Interaction, title: str, description: str):
-            # NEVER strip, NEVER collapse — but DO normalise literal \n
-            title_clean = normalize_ticket_text(title)
-            desc_clean = normalize_ticket_text(description)
-
-            # Snapshot current ticket types
-            types = await db.fetchall(
-                "SELECT id, name, emoji FROM ticket_types "
-                "WHERE guild_id=? ORDER BY id",
-                (i.guild.id,),
-            )
-            if not types:
-                return await i.response.send_message(
-                    "❌ No ticket types configured yet. Use `/ticket type` first.",
-                    ephemeral=True,
-                )
-
-            embed = make_embed(
-                title=title_clean[:256] or "🎫 Support Tickets",
-                description=desc_clean[:4096] or "Click a button below to open a ticket.",
-            )
-            view = TicketPanelView([dict(t) for t in types])
-            msg = await ch.send(embed=embed, view=view)
-
-            # Persistent registration (survives restarts)
-            try:
-                i.client.add_view(view, message_id=msg.id)
-            except Exception:
-                log.exception("add_view(panel) failed")
-
-            await db.execute(
-                "INSERT INTO ticket_panels "
-                "(guild_id, channel_id, message_id, title, description, color, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (i.guild.id, ch.id, msg.id, title_clean, desc_clean,
-                 0x5865F2, iso(now_utc())),
-            )
-
-            await i.response.send_message(
-                f"✅ Ticket panel posted in {ch.mention}.", ephemeral=True
-            )
-
-        await interaction.response.send_modal(
-            TicketPanelModal(on_submit=save_panel)
-        )
-
-    @ticket.command(name="type",
-                    description="Add/update a ticket type (multiline opening message via modal).")
-    @app_commands.describe(
-        name="Ticket type name (e.g. MONEY)",
-        category="Category where ticket channels are created",
-        support_role="Role that can view and manage tickets",
-        emoji="Optional emoji used on the panel button",
-    )
+    @ticket.command(name="type", description="Add or update a ticket type.")
+    @app_commands.describe(name="Name", category="Category", support_role="Support role",
+                           emoji="Optional emoji", message="Intro message (optional)")
     async def t_type(interaction: discord.Interaction, name: str,
                      category: discord.CategoryChannel,
                      support_role: discord.Role,
-                     emoji: Optional[str] = None):
-        if not await require_admin(interaction):
-            return
-
-        # Ensure the row exists/updates with the slash params.
-        # Preserve any existing message so the modal can pre-fill it.
-        existing = await db.fetchone(
-            "SELECT * FROM ticket_types WHERE guild_id=? AND name=?",
-            (interaction.guild.id, name),
-        )
-        existing_msg = existing["message"] if existing else None
-
+                     emoji: Optional[str] = None,
+                     message: Optional[str] = None):
+        if not await require_admin(interaction): return
         await db.execute(
-            "INSERT INTO ticket_types "
-            "(guild_id, name, emoji, category_id, support_role_id, message) "
+            "INSERT INTO ticket_types (guild_id, name, emoji, category_id, support_role_id, message) "
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(guild_id, name) DO UPDATE SET "
             "emoji=excluded.emoji, category_id=excluded.category_id, "
-            "support_role_id=excluded.support_role_id",
-            (interaction.guild.id, name, emoji,
-             category.id, support_role.id, existing_msg),
-        )
-
-        async def save_msg(i: discord.Interaction, value: str):
-            await db.execute(
-                "UPDATE ticket_types SET message=? "
-                "WHERE guild_id=? AND name=?",
-                (normalize_ticket_text(value), i.guild.id, name),
-            )
-            await i.response.send_message(
-                f"✅ Ticket type `{name}` saved with multiline opening message.",
-                ephemeral=True,
-            )
-            # Refresh the persistent panel views for this guild so newly
-            # added types are immediately clickable without a restart.
-            await _reregister_ticket_panel_views(i.client, i.guild.id)
-
-        await interaction.response.send_modal(TicketMessageModal(
-            modal_title=f"Message for: {name}"[:45],
-            default=existing_msg or "",
-            on_submit=save_msg,
-        ))
-
-    @ticket.command(name="message",
-                    description="Edit an existing ticket type's multiline opening message.")
-    @app_commands.describe(name="Ticket type name (as configured with /ticket type)")
-    async def t_message(interaction: discord.Interaction, name: str):
-        if not await require_admin(interaction):
-            return
-        row = await db.fetchone(
-            "SELECT * FROM ticket_types WHERE guild_id=? AND name=?",
-            (interaction.guild.id, name),
-        )
-        if not row:
-            return await interaction.response.send_message(
-                f"❌ Ticket type `{name}` not found.", ephemeral=True
-            )
-
-        async def save(i: discord.Interaction, value: str):
-            await db.execute(
-                "UPDATE ticket_types SET message=? "
-                "WHERE guild_id=? AND name=?",
-                (normalize_ticket_text(value), i.guild.id, name),
-            )
-            await i.response.send_message(
-                f"✅ Opening message for `{name}` updated.", ephemeral=True
-            )
-
-        await interaction.response.send_modal(TicketMessageModal(
-            title=f"Edit message: {name}"[:45],
-            default=row["message"] or "",
-            on_submit=save,
-        ))
+            "support_role_id=excluded.support_role_id, message=excluded.message",
+            (interaction.guild.id, name, emoji, category.id, support_role.id, message))
+        await interaction.response.send_message(f"✅ Ticket type `{name}` saved.", ephemeral=True)
 
     @ticket.command(name="category", description="Update a type's category.")
     async def t_category(interaction: discord.Interaction, name: str,
@@ -2454,7 +2137,6 @@ def register_all_commands(bot: Freakos):
     async def t_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.execute("DELETE FROM ticket_types WHERE guild_id=?", (interaction.guild.id,))
-        await db.execute("DELETE FROM ticket_panels WHERE guild_id=?", (interaction.guild.id,))
         for k in ("ticket.limit", "ticket.cooldown"):
             await db.set_config(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
@@ -3392,78 +3074,6 @@ class TextModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await self._on_submit_cb(interaction, self.text.value)
-
-
-class TicketPanelModal(discord.ui.Modal, title="Ticket Panel Editor"):
-    """
-    Multiline panel editor. Description uses TextStyle.paragraph so admin can
-    type real newlines, blank lines, paragraphs, indentation, and Shift+Enter.
-    """
-    def __init__(self, default_title: str = "", default_description: str = "",
-                 on_submit=None):
-        super().__init__()
-        self._on_submit_cb = on_submit
-
-        self.panel_title = discord.ui.TextInput(
-            label="Panel Title",
-            style=discord.TextStyle.short,
-            default=(default_title or "")[:256],
-            max_length=256,
-            required=True,
-            placeholder="FIREMC MART",
-        )
-        self.panel_description = discord.ui.TextInput(
-            label="Panel Description",
-            style=discord.TextStyle.paragraph,      # <-- unlocks multiline input
-            default=(default_description or "")[:4000],
-            max_length=4000,
-            required=False,
-            placeholder=(
-                "» Select what you want to purchase below.\n\n"
-                "MONEY  → FireMC Balance\n"
-                "GEAR / ARMOUR → Gear & Armour\n"
-                "OP ITEMS → OP Items\n\n"
-                "» Select a button below to open your private ticket.\n"
-                "» Trade smart. Trade safe."
-            ),
-        )
-        self.add_item(self.panel_title)
-        self.add_item(self.panel_description)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await self._on_submit_cb(
-            interaction,
-            self.panel_title.value,
-            self.panel_description.value,
-        )
-
-
-class TicketMessageModal(discord.ui.Modal):
-    """Multiline opening-message editor for a ticket type."""
-
-    def __init__(self, modal_title: str, default: str, on_submit):
-        super().__init__(title=modal_title[:45])
-        self._on_submit_cb = on_submit
-        self.msg = discord.ui.TextInput(
-            label="Opening Message",
-            style=discord.TextStyle.paragraph,      # <-- unlocks multiline input
-            default=(default or "")[:4000],
-            max_length=4000,
-            required=False,
-            placeholder=(
-                "Hey {mention},\n\n"
-                "Thanks for opening a ticket.\n\n"
-                "Please provide:\n"
-                "• Item\n"
-                "• Quantity\n"
-                "• Payment method\n\n"
-                "Support will assist you shortly."
-            ),
-        )
-        self.add_item(self.msg)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await self._on_submit_cb(interaction, self.msg.value)
 
 
 async def _save_and_reply(interaction: discord.Interaction, key: str, value: str):
