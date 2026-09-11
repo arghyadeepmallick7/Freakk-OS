@@ -2289,7 +2289,7 @@ def register_all_commands(bot: Freakos):
             await _reregister_ticket_panel_views(i.client, i.guild.id)
 
         await interaction.response.send_modal(TicketMessageModal(
-            title=f"Message for: {name}"[:45],
+            modal_title=f"Message for: {name}"[:45],
             default=existing_msg or "",
             on_submit=save_msg,
         ))
