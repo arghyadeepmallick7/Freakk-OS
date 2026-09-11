@@ -560,6 +560,7 @@ class TicketCreateButton(discord.ui.View):
 
 
 class TicketPanelModal(discord.ui.Modal, title="Ticket Panel"):
+    """Collects the panel title/description as real multi-line text."""
     panel_title = discord.ui.TextInput(
         label="Title",
         style=discord.TextStyle.short,
@@ -1114,8 +1115,7 @@ class Freakos(commands.Bot):
             if ch:
                 msg_tpl = await self.db.get_config(guild.id, "welcome.message") or \
                     "Welcome {mention} to **{server}**!"
-                rendered = apply_placeholders(
-                    msg_tpl,
+                ph = dict(
                     user=member.name,
                     mention=member.mention,
                     username=member.name,
@@ -1123,11 +1123,33 @@ class Freakos(commands.Bot):
                     server=guild.name,
                     member_count=str(guild.member_count),
                 )
+                rendered = apply_placeholders(msg_tpl, **ph)
+                embed_cfg = await self.db.get_json(
+                    guild.id, "welcome.embed", default={}) or {}
+                use_embed = embed_cfg.get("enabled", True)
                 try:
-                    for c in chunk_message(rendered):
-                        await ch.send(c)
+                    if use_embed:
+                        e = discord.Embed(
+                            description=(rendered or "")[:4096],
+                            color=int(embed_cfg.get("color") or 0x5865F2),
+                            timestamp=now_utc(),
+                        )
+                        if embed_cfg.get("title"):
+                            e.title = apply_placeholders(
+                                str(embed_cfg["title"]), **ph)[:256]
+                        if embed_cfg.get("footer"):
+                            e.set_footer(text=apply_placeholders(
+                                str(embed_cfg["footer"]), **ph)[:2048])
+                        if embed_cfg.get("image"):
+                            e.set_image(url=str(embed_cfg["image"]))
+                        if embed_cfg.get("thumbnail"):
+                            e.set_thumbnail(url=str(embed_cfg["thumbnail"]))
+                        await ch.send(embed=e)
+                    else:
+                        for c in chunk_message(rendered):
+                            await ch.send(c)
                 except Exception:
-                    pass
+                    log.exception("Welcome send failed")
         if await self.db.get_config(guild.id, "autorole.enabled", "0") == "1":
             roles = await self.db.get_json(guild.id, "autorole.roles", default=[])
             good = []
@@ -1163,16 +1185,41 @@ class Freakos(commands.Bot):
             if ch:
                 tpl = await self.db.get_config(guild.id, "departure.message") or \
                     "**{user}** left the server."
-                rendered = apply_placeholders(
-                    tpl, user=member.name, username=member.name,
-                    display_name=member.display_name, mention=member.mention,
-                    server=guild.name, member_count=str(guild.member_count),
+                ph = dict(
+                    user=member.name,
+                    username=member.name,
+                    display_name=member.display_name,
+                    mention=member.mention,
+                    server=guild.name,
+                    member_count=str(guild.member_count),
                 )
+                rendered = apply_placeholders(tpl, **ph)
+                embed_cfg = await self.db.get_json(
+                    guild.id, "departure.embed", default={}) or {}
+                use_embed = embed_cfg.get("enabled", True)
                 try:
-                    for c in chunk_message(rendered):
-                        await ch.send(c)
+                    if use_embed:
+                        e = discord.Embed(
+                            description=(rendered or "")[:4096],
+                            color=int(embed_cfg.get("color") or 0xED4245),
+                            timestamp=now_utc(),
+                        )
+                        if embed_cfg.get("title"):
+                            e.title = apply_placeholders(
+                                str(embed_cfg["title"]), **ph)[:256]
+                        if embed_cfg.get("footer"):
+                            e.set_footer(text=apply_placeholders(
+                                str(embed_cfg["footer"]), **ph)[:2048])
+                        if embed_cfg.get("image"):
+                            e.set_image(url=str(embed_cfg["image"]))
+                        if embed_cfg.get("thumbnail"):
+                            e.set_thumbnail(url=str(embed_cfg["thumbnail"]))
+                        await ch.send(embed=e)
+                    else:
+                        for c in chunk_message(rendered):
+                            await ch.send(c)
                 except Exception:
-                    pass
+                    log.exception("Departure send failed")
         await _log_guild(self, guild, "leaves", "Member Left",
                          f"{member.mention} ({member})")
 
@@ -1207,7 +1254,6 @@ class Freakos(commands.Bot):
             return
         self._vc_cache[member.id] = new_id or 0
 
-        # Global toggle. Default ON so pre-existing setups keep firing.
         if await self.db.get_config(guild.id, "vcnotify.enabled", "1") == "0":
             return
 
@@ -1221,7 +1267,6 @@ class Freakos(commands.Bot):
         if not watch_ids:
             return
 
-        # ===== User LEFT a watched channel =====
         if old_id and old_id in watch_ids and old_ch is not None:
             cfg = await self.db.get_json(guild.id, f"vcnotify.cfg.{old_id}", default={})
             if cfg.get("enabled", True):
@@ -1244,7 +1289,6 @@ class Freakos(commands.Bot):
                     except Exception:
                         log.exception("VC leave notify failed for channel %s", old_id)
 
-        # ===== User JOINED a watched channel =====
         if new_id and new_id in watch_ids and new_ch is not None:
             cfg = await self.db.get_json(guild.id, f"vcnotify.cfg.{new_id}", default={})
             if cfg.get("enabled", True):
@@ -1605,7 +1649,7 @@ def register_all_commands(bot: Freakos):
         await db.set_config(interaction.guild.id, "welcome.channel", channel.id)
         await interaction.response.send_message(f"✅ Channel set to {channel.mention}.", ephemeral=True)
 
-    @welcome.command(name="message", description="Set welcome message (supports newlines).")
+    @welcome.command(name="message", description="Set the embed description / plain message (supports newlines).")
     async def w_message(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         current = await db.get_config(interaction.guild.id, "welcome.message", "") or ""
@@ -1615,22 +1659,49 @@ def register_all_commands(bot: Freakos):
             on_submit=lambda i, v: _save_and_reply(i, "welcome.message", v),
         ))
 
-    @welcome.command(name="embed", description="Set welcome embed (title|color|footer).")
+    @welcome.command(name="embed",
+                     description="Configure the welcome embed (title, color, footer, image, thumbnail).")
+    @app_commands.describe(
+        enabled="Send as an embed? (True/False). Default True.",
+        title="Embed title (supports placeholders).",
+        color="Hex color, e.g. #5865F2.",
+        footer="Embed footer text (supports placeholders).",
+        image="Large banner image URL.",
+        thumbnail="Small thumbnail image URL.",
+    )
     async def w_embed(interaction: discord.Interaction,
+                      enabled: Optional[bool] = True,
                       title: Optional[str] = None,
                       color: Optional[str] = None,
-                      footer: Optional[str] = None):
+                      footer: Optional[str] = None,
+                      image: Optional[str] = None,
+                      thumbnail: Optional[str] = None):
         if not await require_admin(interaction): return
-        cfg = {"title": title, "footer": footer}
-        if color:
+        cfg = await db.get_json(interaction.guild.id, "welcome.embed", default={}) or {}
+        cfg["enabled"] = bool(enabled)
+        if title is not None:
+            cfg["title"] = title or ""
+        if footer is not None:
+            cfg["footer"] = footer or ""
+        if image is not None:
+            cfg["image"] = image or ""
+        if thumbnail is not None:
+            cfg["thumbnail"] = thumbnail or ""
+        if color is not None:
+            parsed = None
             try:
-                cfg["color"] = int(color.replace("#", ""), 16)
+                parsed = int(color.replace("#", "").replace("0x", ""), 16)
             except Exception:
-                pass
+                parsed = None
+            cfg["color"] = parsed if parsed is not None else 0x5865F2
+        else:
+            cfg.setdefault("color", 0x5865F2)
         await db.set_json(interaction.guild.id, "welcome.embed", cfg)
-        await interaction.response.send_message("✅ Welcome embed config saved.", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ Welcome embed config saved. Preview it with `/welcome test`.",
+            ephemeral=True)
 
-    @welcome.command(name="test", description="Send a test welcome message.")
+    @welcome.command(name="test", description="Send a test welcome message/embed.")
     async def w_test(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         ch_id = await db.get_config(interaction.guild.id, "welcome.channel")
@@ -1638,12 +1709,32 @@ def register_all_commands(bot: Freakos):
         if not ch:
             return await interaction.response.send_message("No welcome channel set.", ephemeral=True)
         tpl = await db.get_config(interaction.guild.id, "welcome.message") or "Welcome {mention}!"
-        rendered = apply_placeholders(
-            tpl, user=interaction.user.name, mention=interaction.user.mention,
+        ph = dict(
+            user=interaction.user.name, mention=interaction.user.mention,
             username=interaction.user.name, display_name=interaction.user.display_name,
-            server=interaction.guild.name, member_count=str(interaction.guild.member_count))
-        for c in chunk_message(rendered):
-            await ch.send(c)
+            server=interaction.guild.name,
+            member_count=str(interaction.guild.member_count))
+        rendered = apply_placeholders(tpl, **ph)
+        embed_cfg = await db.get_json(interaction.guild.id, "welcome.embed", default={}) or {}
+        use_embed = embed_cfg.get("enabled", True)
+        if use_embed:
+            e = discord.Embed(
+                description=(rendered or "")[:4096],
+                color=int(embed_cfg.get("color") or 0x5865F2),
+                timestamp=now_utc(),
+            )
+            if embed_cfg.get("title"):
+                e.title = apply_placeholders(str(embed_cfg["title"]), **ph)[:256]
+            if embed_cfg.get("footer"):
+                e.set_footer(text=apply_placeholders(str(embed_cfg["footer"]), **ph)[:2048])
+            if embed_cfg.get("image"):
+                e.set_image(url=str(embed_cfg["image"]))
+            if embed_cfg.get("thumbnail"):
+                e.set_thumbnail(url=str(embed_cfg["thumbnail"]))
+            await ch.send(embed=e)
+        else:
+            for c in chunk_message(rendered):
+                await ch.send(c)
         await interaction.response.send_message("✅ Test sent.", ephemeral=True)
 
     @welcome.command(name="reset", description="Reset welcome config.")
@@ -1776,7 +1867,7 @@ def register_all_commands(bot: Freakos):
         await db.set_config(interaction.guild.id, "departure.channel", channel.id)
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
-    @departure.command(name="message", description="Set departure message.")
+    @departure.command(name="message", description="Set the embed description / plain message (supports newlines).")
     async def d_message(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         current = await db.get_config(interaction.guild.id, "departure.message", "") or ""
@@ -1784,7 +1875,49 @@ def register_all_commands(bot: Freakos):
             title="Departure Message", default=current,
             on_submit=lambda i, v: _save_and_reply(i, "departure.message", v)))
 
-    @departure.command(name="test", description="Send a test departure message.")
+    @departure.command(name="embed",
+                       description="Configure the departure embed (title, color, footer, image, thumbnail).")
+    @app_commands.describe(
+        enabled="Send as an embed? (True/False). Default True.",
+        title="Embed title (supports placeholders).",
+        color="Hex color, e.g. #ED4245.",
+        footer="Embed footer text (supports placeholders).",
+        image="Large banner image URL.",
+        thumbnail="Small thumbnail image URL.",
+    )
+    async def d_embed(interaction: discord.Interaction,
+                      enabled: Optional[bool] = True,
+                      title: Optional[str] = None,
+                      color: Optional[str] = None,
+                      footer: Optional[str] = None,
+                      image: Optional[str] = None,
+                      thumbnail: Optional[str] = None):
+        if not await require_admin(interaction): return
+        cfg = await db.get_json(interaction.guild.id, "departure.embed", default={}) or {}
+        cfg["enabled"] = bool(enabled)
+        if title is not None:
+            cfg["title"] = title or ""
+        if footer is not None:
+            cfg["footer"] = footer or ""
+        if image is not None:
+            cfg["image"] = image or ""
+        if thumbnail is not None:
+            cfg["thumbnail"] = thumbnail or ""
+        if color is not None:
+            parsed = None
+            try:
+                parsed = int(color.replace("#", "").replace("0x", ""), 16)
+            except Exception:
+                parsed = None
+            cfg["color"] = parsed if parsed is not None else 0xED4245
+        else:
+            cfg.setdefault("color", 0xED4245)
+        await db.set_json(interaction.guild.id, "departure.embed", cfg)
+        await interaction.response.send_message(
+            "✅ Departure embed config saved. Preview it with `/departure test`.",
+            ephemeral=True)
+
+    @departure.command(name="test", description="Send a test departure message/embed.")
     async def d_test(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         ch_id = await db.get_config(interaction.guild.id, "departure.channel")
@@ -1793,18 +1926,39 @@ def register_all_commands(bot: Freakos):
             return await interaction.response.send_message("No departure channel set.", ephemeral=True)
         tpl = await db.get_config(interaction.guild.id, "departure.message") or \
             "**{user}** left."
-        rendered = apply_placeholders(
-            tpl, user=interaction.user.name, mention=interaction.user.mention,
+        ph = dict(
+            user=interaction.user.name, mention=interaction.user.mention,
             username=interaction.user.name, display_name=interaction.user.display_name,
-            server=interaction.guild.name, member_count=str(interaction.guild.member_count))
-        for c in chunk_message(rendered):
-            await ch.send(c)
+            server=interaction.guild.name,
+            member_count=str(interaction.guild.member_count))
+        rendered = apply_placeholders(tpl, **ph)
+        embed_cfg = await db.get_json(interaction.guild.id, "departure.embed", default={}) or {}
+        use_embed = embed_cfg.get("enabled", True)
+        if use_embed:
+            e = discord.Embed(
+                description=(rendered or "")[:4096],
+                color=int(embed_cfg.get("color") or 0xED4245),
+                timestamp=now_utc(),
+            )
+            if embed_cfg.get("title"):
+                e.title = apply_placeholders(str(embed_cfg["title"]), **ph)[:256]
+            if embed_cfg.get("footer"):
+                e.set_footer(text=apply_placeholders(str(embed_cfg["footer"]), **ph)[:2048])
+            if embed_cfg.get("image"):
+                e.set_image(url=str(embed_cfg["image"]))
+            if embed_cfg.get("thumbnail"):
+                e.set_thumbnail(url=str(embed_cfg["thumbnail"]))
+            await ch.send(embed=e)
+        else:
+            for c in chunk_message(rendered):
+                await ch.send(c)
         await interaction.response.send_message("✅ Test sent.", ephemeral=True)
 
     @departure.command(name="reset", description="Reset departure.")
     async def d_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        for k in ("departure.channel", "departure.message", "departure.enabled"):
+        for k in ("departure.channel", "departure.message",
+                  "departure.embed", "departure.enabled"):
             await db.set_config(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
@@ -2955,4 +3109,282 @@ def register_all_commands(bot: Freakos):
         if mode not in ("button", "select"):
             return await interaction.response.send_message("mode must be `button` or `select`.", ephemeral=True)
         pid = await db.execute(
-            "INSERT INTO reaction_panels (guild_id, channel_id, title, description, mode
+            "INSERT INTO reaction_panels (guild_id, channel_id, title, description, mode) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (interaction.guild.id, interaction.channel.id, title, description, mode))
+        await interaction.response.send_message(
+            f"✅ Panel `#{pid}` created. Use `/reactionrole add panel_id:{pid} role:@role`.",
+            ephemeral=True)
+
+    @rr.command(name="create", description="Post an existing panel.")
+    async def rr_create(interaction: discord.Interaction, panel_id: int,
+                        channel: Optional[discord.TextChannel] = None):
+        if not await require_admin(interaction): return
+        p = await db.fetchone("SELECT * FROM reaction_panels WHERE id=? AND guild_id=?",
+                              (panel_id, interaction.guild.id))
+        if not p:
+            return await interaction.response.send_message("Panel not found.", ephemeral=True)
+        roles = await db.fetchall(
+            "SELECT role_id, label, emoji FROM reaction_roles WHERE panel_id=?", (panel_id,))
+        view = ReactionRoleView(panel_id, [dict(r) for r in roles], p["mode"] or "button")
+        ch = channel or interaction.channel
+        msg = await ch.send(embed=make_embed(title=p["title"] or "Roles",
+                                             description=p["description"] or None), view=view)
+        await db.execute("UPDATE reaction_panels SET message_id=?, channel_id=? WHERE id=?",
+                         (msg.id, ch.id, panel_id))
+        bot.add_view(view, message_id=msg.id)
+        await interaction.response.send_message("✅ Panel posted.", ephemeral=True)
+
+    @rr.command(name="add", description="Add a role to a panel.")
+    async def rr_add(interaction: discord.Interaction, panel_id: int,
+                     role: discord.Role, label: Optional[str] = None,
+                     emoji: Optional[str] = None):
+        if not await require_admin(interaction): return
+        await db.execute(
+            "INSERT INTO reaction_roles (panel_id, role_id, label, emoji) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(panel_id, role_id) DO UPDATE SET label=excluded.label, emoji=excluded.emoji",
+            (panel_id, role.id, label or role.name, emoji))
+        await interaction.response.send_message("✅ Added (re-post panel to update).", ephemeral=True)
+
+    @rr.command(name="remove", description="Remove a role from a panel.")
+    async def rr_remove(interaction: discord.Interaction, panel_id: int, role: discord.Role):
+        if not await require_admin(interaction): return
+        await db.execute("DELETE FROM reaction_roles WHERE panel_id=? AND role_id=?",
+                         (panel_id, role.id))
+        await interaction.response.send_message("✅ Removed.", ephemeral=True)
+
+    @rr.command(name="list", description="List reaction role panels.")
+    async def rr_list(interaction: discord.Interaction):
+        rows = await db.fetchall(
+            "SELECT * FROM reaction_panels WHERE guild_id=?", (interaction.guild.id,))
+        lines = []
+        for p in rows:
+            cnt = await db.fetchone("SELECT COUNT(*) c FROM reaction_roles WHERE panel_id=?",
+                                    (p["id"],))
+            lines.append(f"• `#{p['id']}` {p['title']} — {cnt['c']} role(s)")
+        await interaction.response.send_message("\n".join(lines) or "*(none)*", ephemeral=True)
+
+    @rr.command(name="reset", description="Reset reaction role panels.")
+    async def rr_reset(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        ids = await db.fetchall("SELECT id FROM reaction_panels WHERE guild_id=?",
+                                (interaction.guild.id,))
+        for r in ids:
+            await db.execute("DELETE FROM reaction_roles WHERE panel_id=?", (r["id"],))
+        await db.execute("DELETE FROM reaction_panels WHERE guild_id=?", (interaction.guild.id,))
+        await interaction.response.send_message("✅ Reset.", ephemeral=True)
+
+    # ================= GIVEAWAYS =================
+    giveaway = app_commands.Group(name="giveaway", description="Giveaways")
+    tree.add_command(giveaway)
+
+    @giveaway.command(name="create", description="Create a giveaway.")
+    async def gw_create(interaction: discord.Interaction, prize: str,
+                        duration: str, winners: int = 1,
+                        channel: Optional[discord.TextChannel] = None):
+        if not await require_admin(interaction): return
+        secs = parse_duration(duration)
+        if not secs:
+            return await interaction.response.send_message("Invalid duration.", ephemeral=True)
+        ch = channel or interaction.channel
+        ends_at = now_utc() + timedelta(seconds=secs)
+        embed = make_embed(
+            title=f"🎉 {prize}",
+            description=f"React with the button to enter!\n"
+                        f"**Winners:** {winners}\n**Ends:** {fmt_dt(ends_at)}")
+        gid = await db.execute(
+            "INSERT INTO giveaways (guild_id, channel_id, prize, winners, host_id, ends_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (interaction.guild.id, ch.id, prize, winners, interaction.user.id, iso(ends_at)))
+        view = GiveawayView(gid)
+        msg = await ch.send(embed=embed, view=view)
+        await db.execute("UPDATE giveaways SET message_id=? WHERE id=?", (msg.id, gid))
+        bot.add_view(view, message_id=msg.id)
+        await bot.scheduler.schedule("giveaway_end", ends_at, {"giveaway_id": gid},
+                                     interaction.guild.id)
+        await interaction.response.send_message(f"✅ Giveaway `#{gid}` started.", ephemeral=True)
+
+    @giveaway.command(name="end", description="End a giveaway immediately.")
+    async def gw_end(interaction: discord.Interaction, giveaway_id: int):
+        if not await require_admin(interaction): return
+        await _end_giveaway(bot, giveaway_id)
+        await interaction.response.send_message("✅ Ended.", ephemeral=True)
+
+    @giveaway.command(name="reroll", description="Reroll winners.")
+    async def gw_reroll(interaction: discord.Interaction, giveaway_id: int):
+        if not await require_admin(interaction): return
+        await _end_giveaway(bot, giveaway_id, reroll=True)
+        await interaction.response.send_message("✅ Rerolled.", ephemeral=True)
+
+    @giveaway.command(name="list", description="List giveaways.")
+    async def gw_list(interaction: discord.Interaction):
+        rows = await db.fetchall("SELECT * FROM giveaways WHERE guild_id=? ORDER BY id DESC",
+                                 (interaction.guild.id,))
+        lines = [f"• `#{r['id']}` **{r['prize']}** — {'ended' if r['ended'] else fmt_dt(parse_iso(r['ends_at']))}"
+                 for r in rows]
+        await interaction.response.send_message("\n".join(lines) or "*(none)*", ephemeral=True)
+
+    # ================= CUSTOM COMMANDS =================
+    cc = app_commands.Group(name="customcommand", description="Custom text commands")
+    tree.add_command(cc)
+
+    @cc.command(name="create", description="Create a custom command.")
+    async def cc_create(interaction: discord.Interaction, name: str, response: str,
+                        embed: bool = False):
+        if not await require_admin(interaction): return
+        await db.execute(
+            "INSERT INTO custom_commands (guild_id, name, response, embed, enabled) "
+            "VALUES (?, ?, ?, ?, 1) "
+            "ON CONFLICT(guild_id, name) DO UPDATE SET response=excluded.response, embed=excluded.embed",
+            (interaction.guild.id, name.lower(), response, 1 if embed else 0))
+        await interaction.response.send_message(
+            f"✅ Created `!{name}`. Supports newlines and placeholders.", ephemeral=True)
+
+    @cc.command(name="edit", description="Edit a custom command.")
+    async def cc_edit(interaction: discord.Interaction, name: str,
+                      response: Optional[str] = None, embed: Optional[bool] = None,
+                      enabled: Optional[bool] = None):
+        if not await require_admin(interaction): return
+        updates, params = [], []
+        if response is not None:
+            updates.append("response=?"); params.append(response)
+        if embed is not None:
+            updates.append("embed=?"); params.append(1 if embed else 0)
+        if enabled is not None:
+            updates.append("enabled=?"); params.append(1 if enabled else 0)
+        if not updates:
+            return await interaction.response.send_message("Nothing.", ephemeral=True)
+        params += [interaction.guild.id, name.lower()]
+        await db.execute(f"UPDATE custom_commands SET {', '.join(updates)} "
+                         "WHERE guild_id=? AND name=?", tuple(params))
+        await interaction.response.send_message("✅ Updated.", ephemeral=True)
+
+    @cc.command(name="delete", description="Delete a custom command.")
+    async def cc_delete(interaction: discord.Interaction, name: str):
+        if not await require_admin(interaction): return
+        await db.execute("DELETE FROM custom_commands WHERE guild_id=? AND name=?",
+                         (interaction.guild.id, name.lower()))
+        await interaction.response.send_message("✅ Deleted.", ephemeral=True)
+
+    @cc.command(name="list", description="List custom commands.")
+    async def cc_list(interaction: discord.Interaction):
+        rows = await db.fetchall("SELECT name, enabled FROM custom_commands WHERE guild_id=?",
+                                 (interaction.guild.id,))
+        lines = [f"• `!{r['name']}` {'🟢' if r['enabled'] else '⚪'}" for r in rows]
+        await interaction.response.send_message("\n".join(lines) or "*(none)*", ephemeral=True)
+
+    @cc.command(name="reset", description="Reset custom commands.")
+    async def cc_reset(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        await db.execute("DELETE FROM custom_commands WHERE guild_id=?", (interaction.guild.id,))
+        await interaction.response.send_message("✅ Reset.", ephemeral=True)
+
+    # ================= ANNOUNCEMENTS =================
+    ann = app_commands.Group(name="announce", description="Announcements")
+    tree.add_command(ann)
+
+    @ann.command(name="create", description="Create an announcement draft.")
+    async def a_create(interaction: discord.Interaction, channel: discord.TextChannel,
+                       title: str, body: str,
+                       image: Optional[str] = None, footer: Optional[str] = None):
+        if not await require_admin(interaction): return
+        aid = await db.execute(
+            "INSERT INTO announcements (guild_id, channel_id, title, body, image, footer, sent) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            (interaction.guild.id, channel.id, title, body, image, footer))
+        await interaction.response.send_message(f"✅ Announcement `#{aid}` created.", ephemeral=True)
+
+    @ann.command(name="edit", description="Edit an announcement.")
+    async def a_edit(interaction: discord.Interaction, announcement_id: int,
+                     title: Optional[str] = None, body: Optional[str] = None,
+                     image: Optional[str] = None, footer: Optional[str] = None):
+        if not await require_admin(interaction): return
+        updates, params = [], []
+        for col, val in (("title", title), ("body", body), ("image", image), ("footer", footer)):
+            if val is not None:
+                updates.append(f"{col}=?"); params.append(val)
+        if not updates:
+            return await interaction.response.send_message("Nothing.", ephemeral=True)
+        params += [announcement_id, interaction.guild.id]
+        await db.execute(f"UPDATE announcements SET {', '.join(updates)} "
+                         "WHERE id=? AND guild_id=?", tuple(params))
+        await interaction.response.send_message("✅ Updated.", ephemeral=True)
+
+    @ann.command(name="send", description="Send an announcement now.")
+    async def a_send(interaction: discord.Interaction, announcement_id: int):
+        if not await require_admin(interaction): return
+        await _run_announcement(bot, {"announcement_id": announcement_id})
+        await interaction.response.send_message("✅ Sent.", ephemeral=True)
+
+    @ann.command(name="schedule", description="Schedule an announcement.")
+    async def a_schedule(interaction: discord.Interaction, announcement_id: int,
+                         in_duration: str):
+        if not await require_admin(interaction): return
+        secs = parse_duration(in_duration)
+        if not secs:
+            return await interaction.response.send_message("Invalid duration.", ephemeral=True)
+        run_at = now_utc() + timedelta(seconds=secs)
+        await db.execute("UPDATE announcements SET scheduled_at=? WHERE id=? AND guild_id=?",
+                         (iso(run_at), announcement_id, interaction.guild.id))
+        await bot.scheduler.schedule("announcement", run_at, {"announcement_id": announcement_id},
+                                     interaction.guild.id)
+        await interaction.response.send_message(f"✅ Scheduled for {fmt_dt(run_at)}.", ephemeral=True)
+
+    @ann.command(name="cancel", description="Cancel a scheduled announcement.")
+    async def a_cancel(interaction: discord.Interaction, announcement_id: int):
+        if not await require_admin(interaction): return
+        await db.execute("UPDATE scheduled_tasks SET completed=1 "
+                         "WHERE task_type='announcement' AND completed=0 "
+                         "AND payload LIKE ?", (f'%"announcement_id": {announcement_id}%',))
+        await interaction.response.send_message("✅ Cancelled (pending tasks marked complete).", ephemeral=True)
+
+
+# =====================================================================
+# Modal helper
+# =====================================================================
+
+class TextModal(discord.ui.Modal):
+    def __init__(self, title: str, default: str, on_submit):
+        super().__init__(title=title[:45])
+        self._on_submit_cb = on_submit
+        self.text = discord.ui.TextInput(
+            label="Message",
+            style=discord.TextStyle.paragraph,
+            default=default[:4000] if default else "",
+            max_length=4000,
+            required=False,
+        )
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self._on_submit_cb(interaction, self.text.value)
+
+
+async def _save_and_reply(interaction: discord.Interaction, key: str, value: str):
+    # Preserve newlines exactly — do NOT strip / split / join.
+    await interaction.client.db.set_config(interaction.guild.id, key, value)
+    await interaction.response.send_message("✅ Saved.", ephemeral=True)
+
+
+# =====================================================================
+# Entry point
+# =====================================================================
+
+async def main():
+    if not TOKEN:
+        log.error("DISCORD_TOKEN missing. Set it in your environment / .env file.")
+        return
+    bot = Freakos()
+    try:
+        await bot.start(TOKEN)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await bot.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
