@@ -160,6 +160,22 @@ async def _send_to_vc_chat(voice_channel: discord.VoiceChannel, content: str) ->
     except Exception:
         log.exception('VC notify: unexpected error')
     return False
+
+
+def unescape_newlines(value: str) -> str:
+    """
+    Convert literal '\\n' sequences (two characters: backslash + n) into real
+    newline characters. This makes ticket type messages entered with escaped
+    newlines render as proper multi-line Discord embeds.
+
+    Any other content — real newlines, spacing, emoji, markdown — is left
+    untouched. Non-string values are returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    return value.replace('\\n', '\n')
+
+
 SCHEMA = "\nCREATE TABLE IF NOT EXISTS guild_config (\n    guild_id INTEGER NOT NULL,\n    key TEXT NOT NULL,\n    value TEXT,\n    PRIMARY KEY (guild_id, key)\n);\nCREATE TABLE IF NOT EXISTS warnings (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    user_id INTEGER NOT NULL,\n    moderator_id INTEGER NOT NULL,\n    reason TEXT,\n    created_at TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS cases (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    user_id INTEGER NOT NULL,\n    moderator_id INTEGER NOT NULL,\n    action TEXT NOT NULL,\n    reason TEXT,\n    created_at TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS timeouts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    user_id INTEGER NOT NULL,\n    moderator_id INTEGER NOT NULL,\n    reason TEXT,\n    ends_at TEXT NOT NULL,\n    dm_sent INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS tickets (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    channel_id INTEGER NOT NULL,\n    user_id INTEGER NOT NULL,\n    type TEXT,\n    status TEXT DEFAULT 'open',\n    claimed_by INTEGER,\n    created_at TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS ticket_types (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    name TEXT NOT NULL,\n    emoji TEXT,\n    category_id INTEGER,\n    support_role_id INTEGER,\n    message TEXT,\n    UNIQUE(guild_id, name)\n);\nCREATE TABLE IF NOT EXISTS vouches (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    user_id INTEGER NOT NULL,\n    voucher_id INTEGER NOT NULL,\n    comment TEXT,\n    created_at TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS shop_products (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    name TEXT NOT NULL,\n    description TEXT,\n    price REAL NOT NULL,\n    stock INTEGER DEFAULT -1,\n    active INTEGER DEFAULT 1,\n    image TEXT\n);\nCREATE TABLE IF NOT EXISTS orders (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    user_id INTEGER NOT NULL,\n    product_id INTEGER NOT NULL,\n    quantity INTEGER NOT NULL,\n    price REAL NOT NULL,\n    status TEXT DEFAULT 'pending',\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS reaction_panels (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    channel_id INTEGER NOT NULL,\n    message_id INTEGER,\n    title TEXT,\n    description TEXT,\n    mode TEXT DEFAULT 'button'\n);\nCREATE TABLE IF NOT EXISTS reaction_roles (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    panel_id INTEGER NOT NULL,\n    role_id INTEGER NOT NULL,\n    label TEXT,\n    emoji TEXT,\n    UNIQUE(panel_id, role_id)\n);\nCREATE TABLE IF NOT EXISTS giveaways (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    channel_id INTEGER NOT NULL,\n    message_id INTEGER,\n    prize TEXT NOT NULL,\n    winners INTEGER DEFAULT 1,\n    host_id INTEGER,\n    ends_at TEXT NOT NULL,\n    ended INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS giveaway_entries (\n    giveaway_id INTEGER NOT NULL,\n    user_id INTEGER NOT NULL,\n    PRIMARY KEY (giveaway_id, user_id)\n);\nCREATE TABLE IF NOT EXISTS custom_commands (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    name TEXT NOT NULL,\n    response TEXT,\n    embed INTEGER DEFAULT 0,\n    enabled INTEGER DEFAULT 1,\n    UNIQUE(guild_id, name)\n);\nCREATE TABLE IF NOT EXISTS announcements (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    guild_id INTEGER NOT NULL,\n    channel_id INTEGER NOT NULL,\n    title TEXT,\n    body TEXT,\n    image TEXT,\n    footer TEXT,\n    scheduled_at TEXT,\n    sent INTEGER DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS scheduled_tasks (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    task_type TEXT NOT NULL,\n    guild_id INTEGER,\n    payload TEXT,\n    run_at TEXT NOT NULL,\n    completed INTEGER DEFAULT 0\n);\nCREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(completed, run_at);\n"
 class Database:
     def __init__(self, path: str): self.path = path; self.conn: Optional[aiosqlite.Connection] = None; self._lock = asyncio.Lock()
@@ -574,7 +590,12 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
     except discord.Forbidden:
         return await interaction.response.send_message('I lack permission to create the ticket channel.', ephemeral=True)
     tid = await db.execute("INSERT INTO tickets (guild_id, channel_id, user_id, type, status, created_at) VALUES (?, ?, ?, ?, 'open', ?)", (guild.id, channel.id, interaction.user.id, ttype, iso(now_utc())))
-    body = row['message'] or f'» **{ttype} Ticket**\n\n» Welcome {interaction.user.mention}.\n» Please describe what you need and staff will assist you.'
+    # Convert any literal \n sequences entered by staff into real newlines so the
+    # ticket description renders as a proper multi-line Discord embed.
+    if row['message']:
+        body = unescape_newlines(row['message'])
+    else:
+        body = f'» **{ttype} Ticket**\n\n» Welcome {interaction.user.mention}.\n» Please describe what you need and staff will assist you.'
     embed = make_embed(title=f'Ticket #{tid} — {ttype}', description=body)
     try:
         await channel.send(content=interaction.user.mention, embed=embed, view=TicketManageView(tid))
