@@ -1,97 +1,86 @@
 """
 FREAKOS — single-file build with ticket system.
 
-Contains: message formatter, database, scheduler, embeds, errors, and the
-core cogs (General, Welcome, Autorole, Autonick, Departure, ActionDM,
-VCNotify, Moderation, Logging, Tickets, CustomCommands, Announcements,
-Giveaways).
+On first run, this file bootstraps an isolated ./pkgs/ directory with a
+fresh copy of discord.py (bypassing the broken container installation in
+.local/), then loads everything from there.
 
 Run:  python bot.py
 """
 from __future__ import annotations
 
 # ============================================================================
-# BOOT FIX — runs BEFORE any other import.  Diagnostics print to console so
-# we can see exactly which discord module Python loads.
+# ISOLATED PACKAGE BOOTSTRAP
+# Bot-Hosting's container ships a broken "discord" stub that shadows the
+# real discord.py. Even .local/lib/python3.14/site-packages/discord/__init__.py
+# is a stub on this container. The only reliable fix is to install a fresh
+# copy of discord.py into a directory we control (./pkgs/) and prepend it
+# to sys.path so our copy always wins.
 # ============================================================================
 import os as _os
 import sys as _sys
+import subprocess as _sp
 
 _HERE = _os.path.dirname(_os.path.abspath(__file__))
-_PYVER = f"python{_sys.version_info.major}.{_sys.version_info.minor}"
+_PKGS = _os.path.join(_HERE, "pkgs")
+_DISCORD_INIT = _os.path.join(_PKGS, "discord", "__init__.py")
 
-_CANDIDATES = [
-    _os.path.join(_HERE, ".local", "lib", _PYVER, "site-packages"),
-    _os.path.join(_HERE, ".local", "lib", "python3.14", "site-packages"),
-    _os.path.join(_HERE, ".local", "lib", "python3.13", "site-packages"),
-    _os.path.join(_HERE, ".local", "lib", "python3.12", "site-packages"),
-    _os.path.join(_HERE, ".local", "lib", "python3.11", "site-packages"),
-    _os.path.join(_HERE, ".local", "lib", "python3.10", "site-packages"),
-]
-_FOUND = [p for p in _CANDIDATES if _os.path.isdir(p)]
 
-# Real .local paths go to the front of sys.path so they beat the system stub.
-_sys.path = _FOUND + [p for p in _sys.path if p not in _FOUND]
+def _looks_like_real_discord(path: str) -> bool:
+    """A cheap sanity check: real discord/__init__.py is several KB."""
+    try:
+        return _os.path.isfile(path) and _os.path.getsize(path) > 1024
+    except OSError:
+        return False
 
-# Drop any cached discord modules so the next import respects the new order.
+
+if not _looks_like_real_discord(_DISCORD_INIT):
+    print("[FREAKOS] Installing isolated packages into ./pkgs/ (first run only)…", flush=True)
+    _os.makedirs(_PKGS, exist_ok=True)
+    _rc = _sp.run(
+        [
+            _sys.executable, "-m", "pip", "install",
+            "--no-cache-dir", "--upgrade",
+            "--target", _PKGS,
+            "discord.py>=2.4.0,<3.0.0",
+            "aiosqlite>=0.20.0",
+            "python-dotenv>=1.0.1",
+        ],
+        check=False,
+    ).returncode
+    print(f"[FREAKOS] pip exit code: {_rc}", flush=True)
+    if _rc != 0:
+        print("[FREAKOS] FATAL: pip install into ./pkgs/ failed.", flush=True)
+        _sys.exit(1)
+
+# Prepend our isolated packages so they beat anything in the container.
+if _PKGS not in _sys.path:
+    _sys.path.insert(0, _PKGS)
+
+# Drop any cached discord modules so the next import respects our path.
 for _k in [k for k in list(_sys.modules.keys()) if k == "discord" or k.startswith("discord.")]:
     del _sys.modules[_k]
 
 import discord as _d
-
-print("=" * 72, flush=True)
-print("[FREAKOS] BOOT DIAGNOSTIC", flush=True)
-print(f"[FREAKOS] Python: {_sys.version.split()[0]}", flush=True)
-print(f"[FREAKOS] .local paths found: {_FOUND}", flush=True)
-print(f"[FREAKOS] sys.path[0:3]: {_sys.path[0:3]}", flush=True)
 print(f"[FREAKOS] discord loaded from: {getattr(_d, '__file__', '?')}", flush=True)
 print(f"[FREAKOS] discord has Bot: {hasattr(_d, 'Bot')}", flush=True)
-print("=" * 72, flush=True)
-
-# If Python still landed on the stub, force-load discord from disk.
-if not hasattr(_d, "Bot"):
-    import importlib.util as _ilu
-    for _base in _FOUND:
-        _target = _os.path.join(_base, "discord", "__init__.py")
-        if _os.path.isfile(_target):
-            print(f"[FREAKOS] Force-loading discord from {_target}", flush=True)
-            try:
-                _spec = _ilu.spec_from_file_location(
-                    "discord", _target,
-                    submodule_search_locations=[_os.path.dirname(_target)],
-                )
-                _mod = _ilu.module_from_spec(_spec)
-                _sys.modules["discord"] = _mod
-                _spec.loader.exec_module(_mod)
-                _d = _mod
-                print(f"[FREAKOS] Force-load OK — has Bot: {hasattr(_d, 'Bot')}", flush=True)
-                break
-            except Exception as _e:
-                print(f"[FREAKOS] Force-load failed: {_e}", flush=True)
 
 if not hasattr(_d, "Bot"):
     print(
-        "\n"
-        "[FREAKOS] FATAL: could not obtain the real discord.py library.\n"
-        "          Loaded module: {}\n"
-        "          Fix: delete bot.py and re-upload this file. If it\n"
-        "          still fails, the container's .local is missing the\n"
-        "          real discord package — delete the whole .local folder\n"
-        "          and restart so pip reinstalls it cleanly.\n".format(
-            getattr(_d, "__file__", "?")
-        ),
+        "[FREAKOS] FATAL: discord.Bot missing even after isolated install.\n"
+        "          Delete the ./pkgs/ folder and restart to force a clean reinstall.",
         flush=True,
     )
     _sys.exit(1)
 
-del _d, _os, _sys
-for _n in ("_HERE", "_PYVER", "_CANDIDATES", "_FOUND", "_k"):
+del _d, _os, _sys, _sp, _HERE, _PKGS, _DISCORD_INIT, _looks_like_real_discord
+for _n in ("_k", "_rc"):
     try:
         del globals()[_n]
     except KeyError:
         pass
 # ============================================================================
-# END BOOT FIX
+# END BOOTSTRAP
 # ============================================================================
 
 import asyncio
