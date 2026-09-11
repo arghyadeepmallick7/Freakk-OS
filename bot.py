@@ -632,6 +632,11 @@ class TicketManageView(discord.ui.View):
             await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
         except Exception:
             pass
+        try:
+            await _schedule_ticket_delete(
+                interaction.client, interaction.guild.id, self.ticket_id)
+        except Exception:
+            log.exception("Failed to schedule ticket auto-delete")
         await interaction.response.send_message("🔒 Ticket closed.")
 
 
@@ -909,6 +914,94 @@ async def _log_guild(bot: "Freakos", guild: discord.Guild, event_key: str,
 # Tasks (invoked by scheduler)
 # =====================================================================
 
+async def _run_ticket_autodelete(bot: "Freakos", payload: dict):
+    """Scheduled task: delete a ticket channel that has been closed for the configured time."""
+    tid = payload.get("ticket_id")
+    if not tid:
+        return
+    row = await bot.db.fetchone("SELECT * FROM tickets WHERE id=?", (tid,))
+    if not row:
+        return
+    # Only auto-delete if it's still closed (user may have reopened)
+    if row["status"] != "closed":
+        return
+    guild = bot.get_guild(row["guild_id"])
+    if not guild:
+        return
+    channel = guild.get_channel(row["channel_id"])
+
+    if channel:
+        # Optional transcript dump
+        try:
+            transcript_chan_id = await bot.db.get_config(guild.id, "ticket.transcript_channel")
+            if transcript_chan_id:
+                tchan = guild.get_channel(int(transcript_chan_id))
+                if tchan:
+                    lines = []
+                    async for m in channel.history(limit=1000, oldest_first=True):
+                        content = m.content or ""
+                        if m.embeds:
+                            for e in m.embeds:
+                                if e.title:
+                                    content += f"\n[embed] {e.title}"
+                                if e.description:
+                                    content += f"\n[embed] {e.description[:200]}"
+                        if m.attachments:
+                            for a in m.attachments:
+                                content += f"\n[attachment] {a.url}"
+                        lines.append(f"[{fmt_dt(m.created_at)}] {m.author}:")
+                        for l in (content or "(no content)").split("\n"):
+                            lines.append(f"    {l}")
+                        lines.append("")
+                    text = "\n".join(lines) or "(empty)"
+                    import io
+                    buf = io.BytesIO(text.encode("utf-8"))
+                    await tchan.send(
+                        f"📄 Auto-delete transcript — Ticket #{tid}",
+                        file=discord.File(buf, filename=f"ticket-{tid}.txt"),
+                    )
+        except Exception:
+            log.exception("Autodelete transcript failed for ticket %s", tid)
+
+        try:
+            await channel.send("🗑 This ticket will be auto-deleted in a moment…")
+            await asyncio.sleep(3)
+            await channel.delete(reason="Ticket auto-deleted (was closed)")
+        except Exception:
+            log.exception("Autodelete channel deletion failed for ticket %s", tid)
+
+    await bot.db.execute("DELETE FROM tickets WHERE id=?", (tid,))
+    await _log_guild(bot, guild, "tickets", "Ticket Auto-Deleted",
+                     f"Ticket `#{tid}` auto-deleted after being closed.")
+
+
+async def _schedule_ticket_delete(bot: "Freakos", guild_id: int, ticket_id: int):
+    """Schedule a channel deletion for a closed ticket, using the guild's autodelete setting."""
+    try:
+        secs = int(await bot.db.get_config(guild_id, "ticket.autodelete", "0") or 0)
+    except (TypeError, ValueError):
+        secs = 0
+    if secs <= 0:
+        return
+    run_at = now_utc() + timedelta(seconds=secs)
+    await bot.scheduler.schedule(
+        "ticket_autodelete",
+        run_at,
+        {"ticket_id": ticket_id},
+        guild_id,
+    )
+
+
+async def _cancel_ticket_delete(bot: "Freakos", ticket_id: int):
+    """Cancel any pending autodelete for this ticket (e.g. on reopen)."""
+    await bot.db.execute(
+        "UPDATE scheduled_tasks SET completed=1 "
+        "WHERE task_type='ticket_autodelete' AND completed=0 "
+        "AND payload LIKE ?",
+        (f'%"ticket_id": {ticket_id}%',),
+    )
+
+
 async def _run_timeout_end(bot: "Freakos", payload: dict):
     tid = payload.get("timeout_id")
     if not tid:
@@ -1105,6 +1198,9 @@ class Freakos(commands.Bot):
 
     async def task_announcement(self, payload: dict):
         await _run_announcement(self, payload)
+
+    async def task_ticket_autodelete(self, payload: dict):
+        await _run_ticket_autodelete(self, payload)
 
     async def on_member_join(self, member: discord.Member):
         guild = member.guild
@@ -2321,6 +2417,29 @@ def register_all_commands(bot: Freakos):
         await db.set_config(interaction.guild.id, "ticket.cooldown", str(seconds))
         await interaction.response.send_message("✅ Set.", ephemeral=True)
 
+    @ticket.command(name="autodelete",
+                    description="Auto-delete ticket channels X time after they're closed. Use 0 to disable.")
+    @app_commands.describe(duration="e.g. 10m, 1h, 2d, or 0 to disable")
+    async def t_autodelete(interaction: discord.Interaction, duration: str):
+        if not await require_admin(interaction): return
+        if duration.strip() == "0":
+            secs = 0
+        else:
+            secs = parse_duration(duration)
+        if secs is None:
+            return await interaction.response.send_message(
+                "❌ Invalid duration. Examples: `10m`, `1h`, `2d`, or `0` to disable.",
+                ephemeral=True)
+        await db.set_config(interaction.guild.id, "ticket.autodelete", str(secs))
+        if secs == 0:
+            await interaction.response.send_message(
+                "✅ Ticket auto-delete **disabled**.", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                f"✅ Tickets will be auto-deleted **{fmt_duration(secs)}** "
+                "after being closed. Reopening cancels the delete.",
+                ephemeral=True)
+
     @ticket.command(name="claim", description="Claim current ticket.")
     async def t_claim(interaction: discord.Interaction):
         row = await db.fetchone("SELECT * FROM tickets WHERE channel_id=?",
@@ -2348,6 +2467,7 @@ def register_all_commands(bot: Freakos):
             await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
         except Exception:
             pass
+        await _schedule_ticket_delete(bot, interaction.guild.id, row["id"])
         await interaction.response.send_message("🔒 Ticket closed.")
 
     @ticket.command(name="reopen", description="Reopen current ticket.")
@@ -2365,6 +2485,7 @@ def register_all_commands(bot: Freakos):
             await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
         except Exception:
             pass
+        await _cancel_ticket_delete(bot, row["id"])
         await interaction.response.send_message("🔓 Reopened.")
 
     @ticket.command(name="delete", description="Delete current ticket channel.")
@@ -2423,7 +2544,7 @@ def register_all_commands(bot: Freakos):
     async def t_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.execute("DELETE FROM ticket_types WHERE guild_id=?", (interaction.guild.id,))
-        for k in ("ticket.limit", "ticket.cooldown"):
+        for k in ("ticket.limit", "ticket.cooldown", "ticket.autodelete"):
             await db.set_config(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
