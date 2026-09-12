@@ -426,7 +426,7 @@ class Scheduler:
 
 
 # =====================================================================
-# Ticket — creation panel + inner room
+# Ticket
 # =====================================================================
 
 class TicketCreateButton(discord.ui.View):
@@ -1392,19 +1392,13 @@ class Freakos(commands.Bot):
         register_all_commands(self)
         await self._restore_persistent_views()
 
-        # --- Fix for CommandSignatureMismatch ---
-        # Push current command schema to Discord so stale definitions are
-        # replaced. Without this, Discord keeps the old schema from a previous
-        # deploy and every changed command throws CommandSignatureMismatch.
+        # Force-sync commands to Discord (fixes CommandSignatureMismatch).
         try:
-            # Copy globals to all joined guilds first, so stale guild-scoped
-            # commands get overwritten by the fresh global set.
             self.tree.copy_global_to(guild=None)
             synced = await self.tree.sync()
             log.info("Synced %d slash commands (global)", len(synced))
         except Exception:
             log.exception("Global command sync failed")
-            # Last-resort: try per-guild sync so commands still work.
             for g in list(self.guilds):
                 try:
                     self.tree.copy_global_to(guild=g)
@@ -1466,7 +1460,6 @@ class Freakos(commands.Bot):
     async def on_member_join(self, member: discord.Member):
         guild = member.guild
 
-        # --- welcome channel message ---
         if await self.db.get_config(guild.id, "welcome.enabled", "0") == "1":
             ch_id = await self.db.get_config(guild.id, "welcome.channel")
             ch = guild.get_channel(int(ch_id)) if ch_id else None
@@ -1516,7 +1509,6 @@ class Freakos(commands.Bot):
                 except Exception:
                     log.exception("Welcome send failed")
 
-        # --- welcome DM ---
         if await self.db.get_config(guild.id, "welcome.dm.enabled", "0") == "1":
             dm_title = await self.db.get_config(guild.id, "welcome.dm.title", "") or ""
             dm_content = await self.db.get_config(guild.id, "welcome.dm.content", "") or ""
@@ -1539,7 +1531,6 @@ class Freakos(commands.Bot):
                 except Exception:
                     log.exception("Welcome DM failed for %s", member.id)
 
-        # --- autorole ---
         if await self.db.get_config(guild.id, "autorole.enabled", "0") == "1":
             roles = await self.db.get_json(guild.id, "autorole.roles", default=[])
             good = [guild.get_role(rid) for rid in roles]
@@ -1550,7 +1541,6 @@ class Freakos(commands.Bot):
                 except Exception:
                     log.exception("Autorole failed")
 
-        # --- autonick ---
         if await self.db.get_config(guild.id, "autonick.enabled", "0") == "1":
             fmt = await self.db.get_config(guild.id, "autonick.format") or "{user}"
             nick = apply_placeholders(
@@ -1946,6 +1936,25 @@ def register_all_commands(bot: Freakos):
         await interaction.response.send_message(
             f"🏓 Pong! `{round(bot.latency*1000)}ms`")
 
+    @tree.command(name="sync", description="Force re-sync of slash commands.")
+    @app_commands.default_permissions(administrator=True)
+    async def sync_cmd(interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "Admin only.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+            synced = await bot.tree.sync()
+            await interaction.followup.send(
+                f"✅ Synced {len(synced)} commands globally.\n"
+                "Restart Discord (Ctrl+R) if they don't appear.",
+                ephemeral=True)
+        except Exception as e:
+            log.exception("Manual sync failed")
+            await interaction.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
+
     @tree.command(name="serverinfo", description="Show server info.")
     async def serverinfo(interaction: discord.Interaction):
         g = interaction.guild
@@ -1988,7 +1997,7 @@ def register_all_commands(bot: Freakos):
     @tree.command(name="help", description="List all bot commands.")
     async def help_cmd(interaction: discord.Interaction):
         cats = {
-            "General": ["ping", "help", "serverinfo", "userinfo", "avatar", "setup"],
+            "General": ["ping", "help", "serverinfo", "userinfo", "avatar", "setup", "sync"],
             "Welcome": ["welcome"],
             "Autorole": ["autorole"],
             "Autonick": ["autonick"],
@@ -2497,79 +2506,104 @@ def register_all_commands(bot: Freakos):
 
     @vcnotify.command(name="setup",
                       description="Bind a voice channel to a text channel and enable notifications.")
+    @app_commands.describe(voice_channel="Voice channel to watch",
+                           text_channel="Text channel where join/leave messages are posted")
     async def v_setup(interaction: discord.Interaction,
                       voice_channel: discord.VoiceChannel,
                       text_channel: discord.TextChannel):
         if not await require_admin(interaction):
             return
-        cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-        cfg["target_channel_id"] = text_channel.id
-        cfg["enabled"] = True
-        await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
+            cfg["target_channel_id"] = text_channel.id
+            cfg["enabled"] = True
+            await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
 
-        watched = await _vc_watched(interaction.guild.id)
-        watched = [int(c) for c in watched if str(c).isdigit()]
-        if voice_channel.id not in watched:
-            watched.append(voice_channel.id)
-            await _vc_set_watched(interaction.guild.id, watched)
+            watched = await _vc_watched(interaction.guild.id)
+            watched = [int(c) for c in watched if str(c).isdigit()]
+            if voice_channel.id not in watched:
+                watched.append(voice_channel.id)
+                await _vc_set_watched(interaction.guild.id, watched)
 
-        await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
-        await interaction.response.send_message(
-            f"✅ Now watching {voice_channel.mention} → {text_channel.mention}.\n"
-            "Use `/vcnotify join-message` and `/vcnotify leave-message` to customise.",
-            ephemeral=True)
+            await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
+            await interaction.followup.send(
+                f"✅ Now watching {voice_channel.mention} → {text_channel.mention}.\n"
+                "Use `/vcnotify join-message` and `/vcnotify leave-message` to customise.",
+                ephemeral=True)
+        except Exception as e:
+            log.exception("vcnotify setup failed")
+            await interaction.followup.send(f"❌ Setup failed: {e}", ephemeral=True)
 
     @vcnotify.command(name="add", description="Watch a voice channel.")
+    @app_commands.describe(voice_channel="Voice channel to watch",
+                           text_channel="Where to post notifications for this VC")
     async def v_add(interaction: discord.Interaction,
                     voice_channel: discord.VoiceChannel,
                     text_channel: discord.TextChannel):
         if not await require_admin(interaction):
             return
-        cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-        cfg["target_channel_id"] = text_channel.id
-        cfg.setdefault("enabled", True)
-        await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
+            cfg["target_channel_id"] = text_channel.id
+            cfg.setdefault("enabled", True)
+            await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
 
-        watched = await _vc_watched(interaction.guild.id)
-        watched = [int(c) for c in watched if str(c).isdigit()]
-        if voice_channel.id not in watched:
-            watched.append(voice_channel.id)
-            await _vc_set_watched(interaction.guild.id, watched)
+            watched = await _vc_watched(interaction.guild.id)
+            watched = [int(c) for c in watched if str(c).isdigit()]
+            if voice_channel.id not in watched:
+                watched.append(voice_channel.id)
+                await _vc_set_watched(interaction.guild.id, watched)
 
-        await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
-        await interaction.response.send_message(
-            f"✅ Added {voice_channel.mention} → {text_channel.mention}.", ephemeral=True)
+            await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
+            await interaction.followup.send(
+                f"✅ Added {voice_channel.mention} → {text_channel.mention}.",
+                ephemeral=True)
+        except Exception as e:
+            log.exception("vcnotify add failed")
+            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
 
     @vcnotify.command(name="remove", description="Stop watching a voice channel.")
+    @app_commands.describe(voice_channel="Voice channel to stop watching")
     async def v_remove(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         if not await require_admin(interaction):
             return
-        watched = await _vc_watched(interaction.guild.id)
-        watched = [c for c in watched if int(c) != voice_channel.id]
-        await _vc_set_watched(interaction.guild.id, watched)
-        await db.set_config(interaction.guild.id, f"vcnotify.cfg.{voice_channel.id}", None)
-        await interaction.response.send_message(
-            f"✅ Stopped watching {voice_channel.mention}.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            watched = await _vc_watched(interaction.guild.id)
+            watched = [c for c in watched if int(c) != voice_channel.id]
+            await _vc_set_watched(interaction.guild.id, watched)
+            await db.set_config(interaction.guild.id,
+                                f"vcnotify.cfg.{voice_channel.id}", None)
+            await interaction.followup.send(
+                f"✅ Stopped watching {voice_channel.mention}.", ephemeral=True)
+        except Exception as e:
+            log.exception("vcnotify remove failed")
+            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
 
     @vcnotify.command(name="enable", description="Enable VC notifications.")
     async def v_enable(interaction: discord.Interaction):
         if not await require_admin(interaction):
             return
+        await interaction.response.defer(ephemeral=True)
         await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
-        await interaction.response.send_message("✅ Enabled.", ephemeral=True)
+        await interaction.followup.send("✅ Enabled.", ephemeral=True)
 
     @vcnotify.command(name="disable", description="Disable VC notifications.")
     async def v_disable(interaction: discord.Interaction):
         if not await require_admin(interaction):
             return
+        await interaction.response.defer(ephemeral=True)
         await db.set_config(interaction.guild.id, "vcnotify.enabled", "0")
-        await interaction.response.send_message("✅ Disabled.", ephemeral=True)
+        await interaction.followup.send("✅ Disabled.", ephemeral=True)
 
     @vcnotify.command(name="list", description="Show watched VCs and settings.")
     async def v_list(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         watched = await _vc_watched(interaction.guild.id)
         if not watched:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "*(no VC notifications configured)*", ephemeral=True)
         global_on = await db.get_config(
             interaction.guild.id, "vcnotify.enabled", "1") != "0"
@@ -2586,7 +2620,7 @@ def register_all_commands(bot: Freakos):
             state = "on" if cfg.get("enabled", True) else "off"
             lines.append(f"• <#{cid}> → {f'<#{tgt}>' if tgt else '*(no target)*'} "
                          f"| per-channel: {state} | join: {jm} | leave: {lm}")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     async def _edit_vc_msg(interaction: discord.Interaction,
                            vc: discord.VoiceChannel, key: str, title: str):
@@ -2606,58 +2640,72 @@ def register_all_commands(bot: Freakos):
 
     @vcnotify.command(name="join-message",
                       description="Set the template posted when someone joins.")
+    @app_commands.describe(voice_channel="Voice channel whose template to edit")
     async def v_join(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         await _edit_vc_msg(interaction, voice_channel, "join_msg", "VC Join Message")
 
     @vcnotify.command(name="leave-message",
                       description="Set the template posted when someone leaves.")
+    @app_commands.describe(voice_channel="Voice channel whose template to edit")
     async def v_leave(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         await _edit_vc_msg(interaction, voice_channel, "leave_msg", "VC Leave Message")
 
     @vcnotify.command(name="test", description="Post a test join + leave message.")
+    @app_commands.describe(voice_channel="Voice channel whose target to test")
     async def v_test(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         if not await require_admin(interaction):
             return
-        cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-        tgt_id = cfg.get("target_channel_id")
-        tgt = interaction.guild.get_channel(int(tgt_id)) if tgt_id else None
-        if not tgt:
-            return await interaction.response.send_message(
-                "❌ No target text channel set for that VC. Run `/vcnotify setup`.",
-                ephemeral=True)
-        join_tpl = cfg.get("join_msg") or "🎧 {mention} joined **{channel_name}**."
-        leave_tpl = cfg.get("leave_msg") or "👋 {mention} left **{channel_name}**."
-        common = dict(
-            mention=interaction.user.mention, user=interaction.user.name,
-            username=interaction.user.name,
-            display_name=interaction.user.display_name,
-            channel_name=voice_channel.name,
-            channel_mention=voice_channel.mention,
-            server=interaction.guild.name)
+        await interaction.response.defer(ephemeral=True)
         try:
+            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
+            tgt_id = cfg.get("target_channel_id")
+            tgt = interaction.guild.get_channel(int(tgt_id)) if tgt_id else None
+            if not tgt:
+                return await interaction.followup.send(
+                    "❌ No target text channel set for that VC. Run `/vcnotify setup`.",
+                    ephemeral=True)
+            join_tpl = cfg.get("join_msg") or "🎧 {mention} joined **{channel_name}**."
+            leave_tpl = cfg.get("leave_msg") or "👋 {mention} left **{channel_name}**."
+            common = dict(
+                mention=interaction.user.mention, user=interaction.user.name,
+                username=interaction.user.name,
+                display_name=interaction.user.display_name,
+                channel_name=voice_channel.name,
+                channel_mention=voice_channel.mention,
+                server=interaction.guild.name)
             for c in chunk_message("[TEST] " + apply_placeholders(join_tpl, **common)):
                 await tgt.send(c)
             for c in chunk_message("[TEST] " + apply_placeholders(leave_tpl, **common)):
                 await tgt.send(c)
+            await interaction.followup.send(
+                f"✅ Test sent to {tgt.mention}.", ephemeral=True)
         except discord.Forbidden:
-            return await interaction.response.send_message(
-                f"❌ I can't post in {tgt.mention}.", ephemeral=True)
-        await interaction.response.send_message(
-            f"✅ Test sent to {tgt.mention}.", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ I can't post in the target channel. Check my permissions.",
+                ephemeral=True)
+        except Exception as e:
+            log.exception("vcnotify test failed")
+            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
 
     @vcnotify.command(name="reset", description="Wipe VC-notification config.")
     async def v_reset(interaction: discord.Interaction):
         if not await require_admin(interaction):
             return
-        await db.set_config(interaction.guild.id, "vcnotify.channels", None)
-        await db.set_config(interaction.guild.id, "vcnotify.enabled", None)
-        rows = await db.fetchall(
-            "SELECT key FROM guild_config WHERE guild_id=? AND key LIKE 'vcnotify.cfg.%'",
-            (interaction.guild.id,))
-        for r in rows:
-            await db.set_config(interaction.guild.id, r["key"], None)
-        await interaction.response.send_message(
-            "✅ VC-notification config reset.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await db.set_config(interaction.guild.id, "vcnotify.channels", None)
+            await db.set_config(interaction.guild.id, "vcnotify.enabled", None)
+            rows = await db.fetchall(
+                "SELECT key FROM guild_config WHERE guild_id=? "
+                "AND key LIKE 'vcnotify.cfg.%'",
+                (interaction.guild.id,))
+            for r in rows:
+                await db.set_config(interaction.guild.id, r["key"], None)
+            await interaction.followup.send(
+                "✅ VC-notification config reset.", ephemeral=True)
+        except Exception as e:
+            log.exception("vcnotify reset failed")
+            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
 
     # ---------------- TICKETS ----------------
     ticket = app_commands.Group(name="ticket", description="Ticket system")
