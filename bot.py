@@ -352,6 +352,13 @@ class Database:
         await self.conn.execute("PRAGMA foreign_keys=ON")
         await self.conn.executescript(SCHEMA)
         await self.conn.commit()
+        # Lightweight migration: add columns introduced after the initial release.
+        for stmt in ("ALTER TABLE tickets ADD COLUMN close_reason TEXT",):
+            try:
+                await self.conn.execute(stmt)
+                await self.conn.commit()
+            except Exception:
+                pass  # column already exists
         log.info("Database ready at %s", self.path)
 
     async def close(self):
@@ -595,65 +602,6 @@ class TicketPanelModal(discord.ui.Modal, title="Ticket Panel"):
         )
 
 
-class TicketManageView(discord.ui.View):
-    """Buttons inside a ticket channel."""
-    def __init__(self, ticket_id: int):
-        super().__init__(timeout=None)
-        self.ticket_id = ticket_id
-
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success,
-                       custom_id="freakos:ticket:claim")
-    async def claim(self, interaction: discord.Interaction, _):
-        row = await interaction.client.db.fetchone(
-            "SELECT * FROM tickets WHERE id=?", (self.ticket_id,)
-        )
-        if not row:
-            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
-        if not is_admin_or_mod(interaction.user):
-            return await interaction.response.send_message("Staff only.", ephemeral=True)
-        await interaction.client.db.execute(
-            "UPDATE tickets SET claimed_by=? WHERE id=?",
-            (interaction.user.id, self.ticket_id),
-        )
-        await interaction.response.send_message(
-            f"✅ Claimed by {interaction.user.mention}"
-        )
-
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary,
-                       custom_id="freakos:ticket:close")
-    async def close(self, interaction: discord.Interaction, _):
-        row = await interaction.client.db.fetchone(
-            "SELECT * FROM tickets WHERE id=?", (self.ticket_id,)
-        )
-        if not row:
-            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
-        if interaction.user.id != row["user_id"] and not is_admin_or_mod(interaction.user):
-            return await interaction.response.send_message("Not allowed.", ephemeral=True)
-        await interaction.client.db.execute(
-            "UPDATE tickets SET status='closed' WHERE id=?", (self.ticket_id,)
-        )
-        try:
-            ow = interaction.channel.overwrites_for(interaction.guild.default_role)
-            ow.send_messages = False
-            await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
-        except Exception:
-            pass
-        await _post_ticket_close_log(interaction.client, interaction.guild, interaction.channel,
-                                     row, interaction.user, "No reason specified")
-        delay = await _ticket_delete_delay(interaction.client.db, interaction.guild.id)
-        if delay > 0:
-            await interaction.response.send_message(
-                f"🔒 Ticket closed. This channel will be deleted automatically in "
-                f"{fmt_duration(delay)}."
-            )
-            await interaction.client.scheduler.schedule(
-                "ticket_delete", now_utc() + timedelta(seconds=delay),
-                {"ticket_id": self.ticket_id}, interaction.guild.id,
-            )
-        else:
-            await interaction.response.send_message("🔒 Ticket closed.")
-
-
 async def _open_ticket(interaction: discord.Interaction, ttype: str):
     guild = interaction.guild
     if not guild:
@@ -731,7 +679,8 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
         "Support will be with you shortly. Please describe your issue."
     )
     embed = make_embed(title=f"Ticket #{tid} — {ttype}", description=body)
-    view = TicketManageView(tid)
+    cfg = await _ticket_room_cfg(db, guild.id)
+    view = TicketRoomView(tid, cfg)
     try:
         await channel.send(content=interaction.user.mention, embed=embed, view=view)
     except Exception:
@@ -967,6 +916,389 @@ async def _post_ticket_close_log(bot: "Freakos", guild: discord.Guild, channel, 
 
 
 # =====================================================================
+# Inner ticket-room button system (buttons shown inside each ticket channel)
+# =====================================================================
+
+TICKET_ROOM_BUTTONS = {
+    "close":        {"label": "Close",              "emoji": "🔒", "style": "danger",    "enabled": True},
+    "close_reason": {"label": "Close With Reason",  "emoji": "🔒", "style": "danger",    "enabled": True},
+    "claim":        {"label": "Claim",              "emoji": "🙋", "style": "success",   "enabled": True},
+    "add_user":     {"label": "Add User",           "emoji": "➕", "style": "secondary", "enabled": True},
+    "remove_user":  {"label": "Remove User",        "emoji": "➖", "style": "secondary", "enabled": True},
+    "lock":         {"label": "Lock",               "emoji": "🔒", "style": "secondary", "enabled": True},
+    "unlock":       {"label": "Unlock",             "emoji": "🔓", "style": "secondary", "enabled": True},
+    "transcript":   {"label": "Transcript",         "emoji": "📄", "style": "secondary", "enabled": True},
+    "notify":       {"label": "Notify",             "emoji": "🔔", "style": "primary",   "enabled": True},
+}
+_BUTTON_STYLES = {
+    "primary": discord.ButtonStyle.primary, "secondary": discord.ButtonStyle.secondary,
+    "success": discord.ButtonStyle.success, "danger": discord.ButtonStyle.danger,
+}
+NOTIFY_COOLDOWN_SECONDS = 60
+
+
+async def _ticket_room_cfg(db: "Database", guild_id: int) -> dict:
+    """Per-guild customization for the inner ticket-room buttons (enabled/label/emoji/style)."""
+    stored = await db.get_json(guild_id, "ticket.room_buttons", default={}) or {}
+    cfg = {k: dict(v) for k, v in TICKET_ROOM_BUTTONS.items()}
+    for key, overrides in stored.items():
+        if key in cfg and isinstance(overrides, dict):
+            cfg[key].update(overrides)
+    return cfg
+
+
+async def _member_can_close(db: "Database", guild_id: int) -> bool:
+    return (await db.get_config(guild_id, "ticket.member_can_close", "1")) != "0"
+
+
+async def _is_ticket_staff(db: "Database", guild: discord.Guild, member: discord.Member, ticket_row=None) -> bool:
+    """Staff = server admins/mods, OR holders of the configured ticket support role(s)."""
+    if is_admin_or_mod(member):
+        return True
+    role_ids = set()
+    global_role = await db.get_config(guild.id, "ticket.support_role_id")
+    if global_role:
+        role_ids.add(int(global_role))
+    if ticket_row is not None:
+        t = await db.fetchone("SELECT support_role_id FROM ticket_types WHERE guild_id=? AND name=?",
+                              (guild.id, ticket_row["type"]))
+        if t and t["support_role_id"]:
+            role_ids.add(t["support_role_id"])
+    return any(r.id in role_ids for r in member.roles) if role_ids else False
+
+
+def _resolve_member_ref(guild: discord.Guild, raw: str) -> Optional[int]:
+    """Extracts a user ID from a raw mention or plain numeric ID string."""
+    raw = (raw or "").strip()
+    m = re.match(r"^<@!?(\d+)>$", raw) or re.match(r"^(\d+)$", raw)
+    return int(m.group(1)) if m else None
+
+
+async def _close_ticket_room(interaction: discord.Interaction, ticket_id: int, reason: str = "No reason specified"):
+    """Shared close routine used by both the Close and Close-With-Reason buttons."""
+    db: Database = interaction.client.db
+    row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (ticket_id,))
+    if not row:
+        return await interaction.followup.send("Ticket not found.", ephemeral=True) if interaction.response.is_done() \
+            else await interaction.response.send_message("Ticket not found.", ephemeral=True)
+    if row["status"] == "closed":
+        msg = "This ticket is already closed."
+        return await interaction.followup.send(msg, ephemeral=True) if interaction.response.is_done() \
+            else await interaction.response.send_message(msg, ephemeral=True)
+
+    await db.execute("UPDATE tickets SET status='closed', close_reason=? WHERE id=?", (reason, ticket_id))
+
+    # Remove the ticket creator's access, keep staff access.
+    try:
+        creator = interaction.guild.get_member(row["user_id"])
+        if creator:
+            await interaction.channel.set_permissions(creator, overwrite=None)
+        ow = interaction.channel.overwrites_for(interaction.guild.default_role)
+        ow.send_messages = False
+        await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
+    except Exception:
+        pass
+
+    closing_text = ("× 〻 Ticket Closed 〻 ×\n\n"
+                   f"𑣲 Closed By:\n{interaction.user.mention}\n\n"
+                   f"» Reason:\n{reason}")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(closing_text)
+        else:
+            await interaction.response.send_message(closing_text)
+    except Exception:
+        pass
+
+    await _post_ticket_close_log(interaction.client, interaction.guild, interaction.channel,
+                                 row, interaction.user, reason)
+
+    delay = await _ticket_delete_delay(db, interaction.guild.id)
+    if delay > 0:
+        try:
+            await interaction.channel.send(f"🗑 This channel will be deleted automatically in {fmt_duration(delay)}.")
+        except Exception:
+            pass
+        await interaction.client.scheduler.schedule(
+            "ticket_delete", now_utc() + timedelta(seconds=delay), {"ticket_id": ticket_id}, interaction.guild.id)
+
+
+class TicketCloseReasonModal(discord.ui.Modal, title="Close Ticket"):
+    reason = discord.ui.TextInput(label="Reason", style=discord.TextStyle.paragraph, max_length=500,
+                                  required=True, placeholder="Why is this ticket being closed?")
+
+    def __init__(self, ticket_id: int):
+        super().__init__()
+        self.ticket_id = ticket_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _close_ticket_room(interaction, self.ticket_id, reason=self.reason.value)
+
+
+class TicketAddUserModal(discord.ui.Modal, title="Add User"):
+    user_input = discord.ui.TextInput(label="User ID or Mention", placeholder="@User or 123456789012345678")
+
+    def __init__(self, ticket_id: int):
+        super().__init__()
+        self.ticket_id = ticket_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = _resolve_member_ref(interaction.guild, self.user_input.value)
+        member = (interaction.guild.get_member(uid) if uid else None)
+        if not member and uid:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except Exception:
+                member = None
+        if not member:
+            return await interaction.response.send_message("❌ Couldn't find that user.", ephemeral=True)
+        try:
+            await interaction.channel.set_permissions(member, view_channel=True, send_messages=True,
+                                                       read_message_history=True)
+        except Exception:
+            return await interaction.response.send_message("❌ Failed to update permissions.", ephemeral=True)
+        await interaction.response.send_message(f"✅ User added to ticket. ({member.mention})")
+
+
+class TicketRemoveUserModal(discord.ui.Modal, title="Remove User"):
+    user_input = discord.ui.TextInput(label="User ID or Mention", placeholder="@User or 123456789012345678")
+
+    def __init__(self, ticket_id: int):
+        super().__init__()
+        self.ticket_id = ticket_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = _resolve_member_ref(interaction.guild, self.user_input.value)
+        member = (interaction.guild.get_member(uid) if uid else None)
+        if not member and uid:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except Exception:
+                member = None
+        if not member:
+            return await interaction.response.send_message("❌ Couldn't find that user.", ephemeral=True)
+        try:
+            await interaction.channel.set_permissions(member, overwrite=None)
+        except Exception:
+            return await interaction.response.send_message("❌ Failed to update permissions.", ephemeral=True)
+        await interaction.response.send_message(f"✅ User removed from ticket. ({member.mention})")
+
+
+class TicketCloseConfirmView(discord.ui.View):
+    """Ephemeral yes/no confirmation shown before a plain Close goes through."""
+    def __init__(self, ticket_id: int):
+        super().__init__(timeout=60)
+        self.ticket_id = ticket_id
+
+    @discord.ui.button(label="Confirm Close", style=discord.ButtonStyle.danger, emoji="🔒")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content="Closing ticket…", view=self)
+        await _close_ticket_room(interaction, self.ticket_id)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="❌ Close cancelled.", view=None)
+
+
+class TicketRoomView(discord.ui.View):
+    """The full ticket-management button panel shown inside each ticket channel.
+
+    Buttons shown/hidden, their labels/emojis/colors, come from `_ticket_room_cfg`
+    (guild-configurable via `/ticket button`). This replaces the older, simpler
+    claim/close-only view.
+    """
+    def __init__(self, ticket_id: int, cfg: dict, claimed_by: Optional[int] = None):
+        super().__init__(timeout=None)
+        self.ticket_id = ticket_id
+        self.claimed_by = claimed_by
+
+        def add(key: str, label: str, emoji: str, style_key: str, custom_id: str, callback):
+            b = cfg.get(key, {})
+            if not b.get("enabled", True):
+                return
+            btn = discord.ui.Button(
+                label=b.get("label", label), emoji=b.get("emoji", emoji) or None,
+                style=_BUTTON_STYLES.get(b.get("style", style_key), discord.ButtonStyle.secondary),
+                custom_id=custom_id)
+            btn.callback = callback
+            self.add_item(btn)
+
+        add("close", "Close", "🔒", "danger", f"freakos:tr:close:{ticket_id}", self._cb_close)
+        add("close_reason", "Close With Reason", "🔒", "danger", f"freakos:tr:closereason:{ticket_id}",
+            self._cb_close_reason)
+
+        claim_cfg = cfg.get("claim", {})
+        if claim_cfg.get("enabled", True):
+            if claimed_by:
+                btn = discord.ui.Button(label="Unclaim", emoji="↩", style=discord.ButtonStyle.secondary,
+                                        custom_id=f"freakos:tr:unclaim:{ticket_id}")
+                btn.callback = self._cb_unclaim
+            else:
+                btn = discord.ui.Button(
+                    label=claim_cfg.get("label", "Claim"), emoji=claim_cfg.get("emoji", "🙋") or None,
+                    style=_BUTTON_STYLES.get(claim_cfg.get("style", "success"), discord.ButtonStyle.success),
+                    custom_id=f"freakos:tr:claim:{ticket_id}")
+                btn.callback = self._cb_claim
+            self.add_item(btn)
+
+        add("add_user", "Add User", "➕", "secondary", f"freakos:tr:adduser:{ticket_id}", self._cb_add_user)
+        add("remove_user", "Remove User", "➖", "secondary", f"freakos:tr:removeuser:{ticket_id}", self._cb_remove_user)
+        add("lock", "Lock", "🔒", "secondary", f"freakos:tr:lock:{ticket_id}", self._cb_lock)
+        add("unlock", "Unlock", "🔓", "secondary", f"freakos:tr:unlock:{ticket_id}", self._cb_unlock)
+        add("transcript", "Transcript", "📄", "secondary", f"freakos:tr:transcript:{ticket_id}", self._cb_transcript)
+        add("notify", "Notify", "🔔", "primary", f"freakos:tr:notify:{ticket_id}", self._cb_notify)
+
+    async def _cb_close(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row:
+            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
+        if row["status"] == "closed":
+            return await interaction.response.send_message("Already closed.", ephemeral=True)
+        is_staff = await _is_ticket_staff(db, interaction.guild, interaction.user, row)
+        if interaction.user.id == row["user_id"] and not is_staff:
+            if not await _member_can_close(db, interaction.guild.id):
+                return await interaction.response.send_message("Closing is disabled for members.", ephemeral=True)
+        elif not is_staff and interaction.user.id != row["user_id"]:
+            return await interaction.response.send_message("Not allowed.", ephemeral=True)
+        await interaction.response.send_message("Are you sure you want to close this ticket?",
+                                                 view=TicketCloseConfirmView(self.ticket_id), ephemeral=True)
+
+    async def _cb_close_reason(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row:
+            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
+        if row["status"] == "closed":
+            return await interaction.response.send_message("Already closed.", ephemeral=True)
+        is_staff = await _is_ticket_staff(db, interaction.guild, interaction.user, row)
+        if interaction.user.id == row["user_id"] and not is_staff:
+            if not await _member_can_close(db, interaction.guild.id):
+                return await interaction.response.send_message("Closing is disabled for members.", ephemeral=True)
+        elif not is_staff and interaction.user.id != row["user_id"]:
+            return await interaction.response.send_message("Not allowed.", ephemeral=True)
+        await interaction.response.send_modal(TicketCloseReasonModal(self.ticket_id))
+
+    async def _cb_claim(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row:
+            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
+        if not await _is_ticket_staff(db, interaction.guild, interaction.user, row):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        if row["claimed_by"]:
+            return await interaction.response.send_message(f"Already claimed by <@{row['claimed_by']}>.", ephemeral=True)
+        await db.execute("UPDATE tickets SET claimed_by=? WHERE id=?", (interaction.user.id, self.ticket_id))
+        cfg = await _ticket_room_cfg(db, interaction.guild.id)
+        new_view = TicketRoomView(self.ticket_id, cfg, interaction.user.id)
+        await interaction.response.edit_message(view=new_view)
+        interaction.client.add_view(new_view)
+        await interaction.followup.send(f"🙋 **Claimed By:**\n{interaction.user.mention}")
+
+    async def _cb_unclaim(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row:
+            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
+        if not await _is_ticket_staff(db, interaction.guild, interaction.user, row):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        if row["claimed_by"] and row["claimed_by"] != interaction.user.id and not is_admin_or_mod(interaction.user):
+            return await interaction.response.send_message(
+                f"Only <@{row['claimed_by']}> (or an admin) can unclaim this.", ephemeral=True)
+        await db.execute("UPDATE tickets SET claimed_by=NULL WHERE id=?", (self.ticket_id,))
+        cfg = await _ticket_room_cfg(db, interaction.guild.id)
+        new_view = TicketRoomView(self.ticket_id, cfg, None)
+        await interaction.response.edit_message(view=new_view)
+        interaction.client.add_view(new_view)
+        await interaction.followup.send(f"↩ Ticket unclaimed by {interaction.user.mention}.")
+
+    async def _cb_add_user(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row or not await _is_ticket_staff(db, interaction.guild, interaction.user, row):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        await interaction.response.send_modal(TicketAddUserModal(self.ticket_id))
+
+    async def _cb_remove_user(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row or not await _is_ticket_staff(db, interaction.guild, interaction.user, row):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        await interaction.response.send_modal(TicketRemoveUserModal(self.ticket_id))
+
+    async def _cb_lock(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row or not await _is_ticket_staff(db, interaction.guild, interaction.user, row):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        creator = interaction.guild.get_member(row["user_id"])
+        try:
+            if creator:
+                await interaction.channel.set_permissions(creator, view_channel=True, send_messages=False,
+                                                          read_message_history=True)
+        except Exception:
+            pass
+        await interaction.response.send_message(f"🔒 Ticket locked by {interaction.user.mention}.")
+
+    async def _cb_unlock(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row or not await _is_ticket_staff(db, interaction.guild, interaction.user, row):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        creator = interaction.guild.get_member(row["user_id"])
+        try:
+            if creator:
+                await interaction.channel.set_permissions(creator, view_channel=True, send_messages=True,
+                                                          read_message_history=True)
+        except Exception:
+            pass
+        await interaction.response.send_message(f"🔓 Ticket unlocked by {interaction.user.mention}.")
+
+    async def _cb_transcript(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row or not await _is_ticket_staff(db, interaction.guild, interaction.user, row):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        ch_id = await db.get_config(interaction.guild.id, "ticket.transcript_channel") or \
+            await db.get_config(interaction.guild.id, "ticket.logs_channel")
+        target = interaction.guild.get_channel(int(ch_id)) if ch_id else None
+        if target:
+            try:
+                await target.send(content=f"📄 Transcript for ticket #{row['id']} ({interaction.channel.mention})",
+                                  file=await _generate_transcript(interaction.channel))
+                await interaction.followup.send(f"✅ Transcript sent to {target.mention}.", ephemeral=True)
+            except Exception:
+                log.exception("Failed to send transcript for ticket %s", row["id"])
+                await interaction.followup.send("❌ Failed to send transcript.", ephemeral=True)
+        else:
+            await interaction.followup.send(file=await _generate_transcript(interaction.channel), ephemeral=True)
+
+    async def _cb_notify(self, interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone("SELECT * FROM tickets WHERE id=?", (self.ticket_id,))
+        if not row:
+            return await interaction.response.send_message("Ticket not found.", ephemeral=True)
+        bot = interaction.client
+        now = now_utc().timestamp()
+        last = bot._notify_cooldown.get(self.ticket_id, 0)
+        if now - last < NOTIFY_COOLDOWN_SECONDS:
+            rem = int(NOTIFY_COOLDOWN_SECONDS - (now - last))
+            return await interaction.response.send_message(f"⏳ Please wait {rem}s before notifying again.", ephemeral=True)
+        bot._notify_cooldown[self.ticket_id] = now
+        role_id = await db.get_config(interaction.guild.id, "ticket.support_role_id")
+        if not role_id:
+            t = await db.fetchone("SELECT support_role_id FROM ticket_types WHERE guild_id=? AND name=?",
+                                  (interaction.guild.id, row["type"]))
+            role_id = t["support_role_id"] if t else None
+        mention = f"<@&{role_id}>" if role_id else "@here"
+        await interaction.response.send_message(
+            f"🔔 **Staff Notification**\n\n{mention}\n\nA user needs help in:\n{interaction.channel.mention}")
+
+
+# =====================================================================
 # Tasks (invoked by scheduler)
 # =====================================================================
 
@@ -1126,6 +1458,7 @@ class Freakos(commands.Bot):
         self.scheduler: Optional[Scheduler] = None
         self._vc_cache: dict[int, int] = {}
         self._spam_tracker: dict[tuple, list[float]] = {}
+        self._notify_cooldown: dict[int, float] = {}  # ticket_id -> last Notify-button timestamp
 
     async def setup_hook(self):
         await self.db.connect()
@@ -1138,9 +1471,10 @@ class Freakos(commands.Bot):
     async def _restore_persistent_views(self):
         self.add_view(TicketCreateButton())
         self.add_view(ShopPanelView())
-        rows = await self.db.fetchall("SELECT id FROM tickets WHERE status='open'")
+        rows = await self.db.fetchall("SELECT id, guild_id, claimed_by FROM tickets WHERE status='open'")
         for r in rows:
-            self.add_view(TicketManageView(r["id"]))
+            cfg = await _ticket_room_cfg(self.db, r["guild_id"])
+            self.add_view(TicketRoomView(r["id"], cfg, r["claimed_by"]))
         gws = await self.db.fetchall("SELECT id FROM giveaways WHERE ended=0")
         for g in gws:
             self.add_view(GiveawayView(g["id"]))
@@ -2428,6 +2762,59 @@ def register_all_commands(bot: Freakos):
         await interaction.response.send_message(
             f"✅ Ticket logs (with auto transcripts) will be posted to {channel.mention}.", ephemeral=True)
 
+    @ticket.command(name="transcript-channel", description="Set the channel for on-demand ticket transcripts.")
+    async def t_transcript_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+        if not await require_admin(interaction): return
+        await db.set_config(interaction.guild.id, "ticket.transcript_channel", channel.id)
+        await interaction.response.send_message(f"✅ Transcripts will be sent to {channel.mention}.", ephemeral=True)
+
+    @ticket.command(name="supportrole", description="Set the global ticket support/staff role (for claim/notify/etc.).")
+    async def t_support_role_global(interaction: discord.Interaction, role: discord.Role):
+        if not await require_admin(interaction): return
+        await db.set_config(interaction.guild.id, "ticket.support_role_id", role.id)
+        await interaction.response.send_message(f"✅ Ticket support role set to {role.mention}.", ephemeral=True)
+
+    @ticket.command(name="memberclose", description="Allow/disallow the ticket creator from closing their own ticket.")
+    async def t_member_close(interaction: discord.Interaction, enabled: bool):
+        if not await require_admin(interaction): return
+        await db.set_config(interaction.guild.id, "ticket.member_can_close", "1" if enabled else "0")
+        await interaction.response.send_message("✅ Saved.", ephemeral=True)
+
+    @ticket.command(name="button", description="Customize an inner-ticket button (enable/label/emoji/color).")
+    @app_commands.describe(button="Which button to customize", enabled="Show this button in tickets?",
+                           label="Button text", emoji="Button emoji",
+                           style="primary / secondary / success / danger")
+    @app_commands.choices(button=[
+        app_commands.Choice(name="Close", value="close"),
+        app_commands.Choice(name="Close With Reason", value="close_reason"),
+        app_commands.Choice(name="Claim / Unclaim", value="claim"),
+        app_commands.Choice(name="Add User", value="add_user"),
+        app_commands.Choice(name="Remove User", value="remove_user"),
+        app_commands.Choice(name="Lock", value="lock"),
+        app_commands.Choice(name="Unlock", value="unlock"),
+        app_commands.Choice(name="Transcript", value="transcript"),
+        app_commands.Choice(name="Notify", value="notify"),
+    ])
+    async def t_button(interaction: discord.Interaction, button: app_commands.Choice[str],
+                       enabled: Optional[bool] = None, label: Optional[str] = None,
+                       emoji: Optional[str] = None, style: Optional[str] = None):
+        if not await require_admin(interaction): return
+        stored = await db.get_json(interaction.guild.id, "ticket.room_buttons", default={})
+        entry = dict(stored.get(button.value, {}))
+        if enabled is not None:
+            entry["enabled"] = enabled
+        if label is not None:
+            entry["label"] = label[:80]
+        if emoji is not None:
+            entry["emoji"] = emoji
+        if style is not None and style.lower() in _BUTTON_STYLES:
+            entry["style"] = style.lower()
+        stored[button.value] = entry
+        await db.set_json(interaction.guild.id, "ticket.room_buttons", stored)
+        await interaction.response.send_message(
+            f"✅ Updated the `{button.name}` button. New tickets (and existing open ones after "
+            "claim/unclaim) will use it.", ephemeral=True)
+
     @ticket.command(name="claim", description="Claim current ticket.")
     async def t_claim(interaction: discord.Interaction):
         row = await db.fetchone("SELECT * FROM tickets WHERE channel_id=?",
@@ -2536,7 +2923,9 @@ def register_all_commands(bot: Freakos):
     async def t_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.execute("DELETE FROM ticket_types WHERE guild_id=?", (interaction.guild.id,))
-        for k in ("ticket.limit", "ticket.cooldown", "ticket.close_delete_delay", "ticket.logs_channel"):
+        for k in ("ticket.limit", "ticket.cooldown", "ticket.close_delete_delay", "ticket.logs_channel",
+                 "ticket.transcript_channel", "ticket.support_role_id", "ticket.member_can_close",
+                 "ticket.room_buttons"):
             await db.set_config(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
 
