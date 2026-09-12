@@ -1641,39 +1641,26 @@ class Freakos(commands.Bot):
             if await self.db.get_config(guild.id, "vcnotify.enabled", "1") == "0":
                 return
 
-            raw_watch = await self.db.get_json(
-                guild.id, "vcnotify.channels", default=[]) or []
-            if not raw_watch:
-                return
-
-            watch_ids: set[int] = set()
-            for c in raw_watch:
-                try:
-                    watch_ids.add(int(c))
-                except (TypeError, ValueError):
-                    continue
-            if not watch_ids:
+            me = guild.me
+            if me is None:
                 return
 
             async def _fire(cfg_key: str, ch, tpl_default: str, kind: str):
+                # Only voice channels have a built-in text chat (skip stages).
+                if not isinstance(ch, discord.VoiceChannel):
+                    return
                 cfg = await self.db.get_json(guild.id, cfg_key, default={}) or {}
                 if not cfg.get("enabled", True):
                     return
-                target_id = cfg.get("target_channel_id")
-                if not target_id:
-                    log.warning("VC notify: no target channel set for %s", cfg_key)
-                    return
+                # Make sure we're allowed to post in this VC's own text chat.
                 try:
-                    target = guild.get_channel(int(target_id))
-                except (TypeError, ValueError):
-                    target = None
-                if target is None:
-                    try:
-                        target = await self.fetch_channel(int(target_id))
-                    except Exception:
-                        target = None
-                if target is None:
-                    log.warning("VC notify: target channel %s not found", target_id)
+                    perms = ch.permissions_for(me)
+                except Exception:
+                    perms = None
+                if perms is None or not (perms.view_channel and perms.send_messages):
+                    log.warning(
+                        "VC notify: missing permission to post in #%s text chat",
+                        getattr(ch, "name", getattr(ch, "id", "?")))
                     return
                 tpl = cfg.get(f"{kind}_msg") or tpl_default
                 rendered = apply_placeholders(
@@ -1683,17 +1670,23 @@ class Freakos(commands.Bot):
                     server=guild.name)
                 for c in chunk_message(rendered):
                     try:
-                        await target.send(c)
+                        # Posts into the voice channel's OWN built-in text chat.
+                        await ch.send(c)
+                    except discord.Forbidden:
+                        log.warning(
+                            "VC notify: forbidden to post in #%s text chat",
+                            getattr(ch, "name", getattr(ch, "id", "?")))
+                        return
                     except Exception:
                         log.exception(
-                            "VC %s notify failed (channel=%s, target=%s)",
-                            kind, ch.id, getattr(target, "id", "?"))
+                            "VC %s notify failed (channel=%s)", kind, ch.id)
                         return
 
-            if old_id and old_id in watch_ids and old_ch is not None:
+            # Every voice channel works independently — no separate target needed.
+            if old_id and old_ch is not None:
                 await _fire(f"vcnotify.cfg.{old_id}", old_ch,
                             "👋 {mention} left **{channel_name}**.", "leave")
-            if new_id and new_id in watch_ids and new_ch is not None:
+            if new_id and new_ch is not None:
                 await _fire(f"vcnotify.cfg.{new_id}", new_ch,
                             "🎧 {mention} joined **{channel_name}**.", "join")
         except Exception:
@@ -2056,7 +2049,7 @@ def register_all_commands(bot: Freakos):
             ("Autonick", await db.get_config(g.id, "autonick.enabled", "0") == "1"),
             ("Departure", await db.get_config(g.id, "departure.enabled", "0") == "1"),
             ("Action DMs", await db.get_config(g.id, "actiondm.enabled", "0") == "1"),
-            ("VC Notifications", bool(await db.get_json(g.id, "vcnotify.channels", default=[]))),
+            ("VC Notifications", await db.get_config(g.id, "vcnotify.enabled", "1") != "0"),
             ("Tickets", bool(await db.fetchall(
                 "SELECT 1 FROM ticket_types WHERE guild_id=?", (g.id,)))),
             ("Vouches", bool(await db.get_config(g.id, "vouch.channel"))),
@@ -2530,15 +2523,11 @@ def register_all_commands(bot: Freakos):
         except Exception:
             log.exception("Failed to send vcnotify error reply")
 
-    @vcnotify.command(name="setup",
-                      description="Bind a voice channel to a text channel and enable notifications.")
-    @app_commands.describe(voice_channel="Voice channel to watch",
-                           text_channel="Text channel where join/leave messages are posted")
-    async def v_setup(interaction: discord.Interaction,
-                      voice_channel: discord.VoiceChannel,
-                      text_channel: discord.TextChannel):
+    @vcnotify.command(
+        name="setup",
+        description="Enable VC notifications (posted in each voice channel's own text chat).")
+    async def v_setup(interaction: discord.Interaction):
         # Defer FIRST so Discord always gets an acknowledgement within 3s.
-        # This is what fixes "The application did not respond".
         await interaction.response.defer(ephemeral=True)
         try:
             if not interaction.guild:
@@ -2547,32 +2536,26 @@ def register_all_commands(bot: Freakos):
                 return await interaction.followup.send(
                     "You need Manage Server / Administrator.", ephemeral=True)
 
-            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-            cfg["target_channel_id"] = text_channel.id
-            cfg["enabled"] = True
-            await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
-
-            watched = await _vc_watched(interaction.guild.id)
-            watched = [int(c) for c in watched if str(c).isdigit()]
-            if voice_channel.id not in watched:
-                watched.append(voice_channel.id)
-            await _vc_set_watched(interaction.guild.id, watched)
-
             await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
             await interaction.followup.send(
-                f"✅ Now watching {voice_channel.mention} → {text_channel.mention}.\n"
-                "Use `/vcnotify join-message` and `/vcnotify leave-message` to customise.",
+                "✅ VC notifications enabled.\n"
+                "Join/leave messages are posted **inside each voice channel's own "
+                "text chat** — no separate text channel needed.\n"
+                "This applies to **every** voice channel automatically "
+                "(General 1, General 2, Gaming, Music, Staff VC, …).\n"
+                "Customise a specific VC with `/vcnotify join-message` and "
+                "`/vcnotify leave-message`.",
                 ephemeral=True)
         except Exception as e:
             log.exception("vcnotify setup failed")
             await _vc_reply_error(interaction, f"❌ Setup failed: {e}")
 
-    @vcnotify.command(name="add", description="Watch a voice channel.")
-    @app_commands.describe(voice_channel="Voice channel to watch",
-                           text_channel="Where to post notifications for this VC")
+    @vcnotify.command(
+        name="add",
+        description="Enable notifications for one voice channel (posts in its own text chat).")
+    @app_commands.describe(voice_channel="Voice channel to enable")
     async def v_add(interaction: discord.Interaction,
-                    voice_channel: discord.VoiceChannel,
-                    text_channel: discord.TextChannel):
+                    voice_channel: discord.VoiceChannel):
         # Defer FIRST so Discord always gets an acknowledgement within 3s.
         await interaction.response.defer(ephemeral=True)
         try:
@@ -2583,41 +2566,39 @@ def register_all_commands(bot: Freakos):
                     "You need Manage Server / Administrator.", ephemeral=True)
 
             cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-            cfg["target_channel_id"] = text_channel.id
-            cfg.setdefault("enabled", True)
+            cfg["enabled"] = True
             await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
-
-            watched = await _vc_watched(interaction.guild.id)
-            watched = [int(c) for c in watched if str(c).isdigit()]
-            if voice_channel.id not in watched:
-                watched.append(voice_channel.id)
-            await _vc_set_watched(interaction.guild.id, watched)
-
             await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
             await interaction.followup.send(
-                f"✅ Added {voice_channel.mention} → {text_channel.mention}.",
+                f"✅ Notifications enabled for {voice_channel.mention}. "
+                "Messages will post in its own text chat.",
                 ephemeral=True)
         except Exception as e:
             log.exception("vcnotify add failed")
             await _vc_reply_error(interaction, f"❌ Failed: {e}")
 
-    @vcnotify.command(name="remove", description="Stop watching a voice channel.")
-    @app_commands.describe(voice_channel="Voice channel to stop watching")
+    @vcnotify.command(
+        name="remove",
+        description="Disable notifications for one voice channel.")
+    @app_commands.describe(voice_channel="Voice channel to silence")
     async def v_remove(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
-        if not await require_admin(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         try:
-            watched = await _vc_watched(interaction.guild.id)
-            watched = [c for c in watched if int(c) != voice_channel.id]
-            await _vc_set_watched(interaction.guild.id, watched)
-            await db.set_config(interaction.guild.id,
-                                f"vcnotify.cfg.{voice_channel.id}", None)
+            if not interaction.guild:
+                return await interaction.followup.send("Guild only.", ephemeral=True)
+            if not is_admin_or_mod(interaction.user):
+                return await interaction.followup.send(
+                    "You need Manage Server / Administrator.", ephemeral=True)
+
+            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
+            cfg["enabled"] = False
+            await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
             await interaction.followup.send(
-                f"✅ Stopped watching {voice_channel.mention}.", ephemeral=True)
+                f"✅ Disabled notifications for {voice_channel.mention}.",
+                ephemeral=True)
         except Exception as e:
             log.exception("vcnotify remove failed")
-            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
+            await _vc_reply_error(interaction, f"❌ Failed: {e}")
 
     @vcnotify.command(name="enable", description="Enable VC notifications.")
     async def v_enable(interaction: discord.Interaction):
@@ -2635,29 +2616,46 @@ def register_all_commands(bot: Freakos):
         await db.set_config(interaction.guild.id, "vcnotify.enabled", "0")
         await interaction.followup.send("✅ Disabled.", ephemeral=True)
 
-    @vcnotify.command(name="list", description="Show watched VCs and settings.")
+    @vcnotify.command(name="list", description="Show VC notification settings.")
     async def v_list(interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        watched = await _vc_watched(interaction.guild.id)
-        if not watched:
-            return await interaction.followup.send(
-                "*(no VC notifications configured)*", ephemeral=True)
-        global_on = await db.get_config(
-            interaction.guild.id, "vcnotify.enabled", "1") != "0"
-        lines = [f"**Global state:** {'🟢 enabled' if global_on else '🔴 disabled'}"]
-        for cid in watched:
-            try:
-                cid = int(cid)
-            except (TypeError, ValueError):
-                continue
-            cfg = await _vc_get_cfg(interaction.guild.id, cid)
-            tgt = cfg.get("target_channel_id")
-            jm = "✏️ custom" if cfg.get("join_msg") else "default"
-            lm = "✏️ custom" if cfg.get("leave_msg") else "default"
-            state = "on" if cfg.get("enabled", True) else "off"
-            lines.append(f"• <#{cid}> → {f'<#{tgt}>' if tgt else '*(no target)*'} "
-                         f"| per-channel: {state} | join: {jm} | leave: {lm}")
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        try:
+            if not interaction.guild:
+                return await interaction.followup.send("Guild only.", ephemeral=True)
+            global_on = await db.get_config(
+                interaction.guild.id, "vcnotify.enabled", "1") != "0"
+            lines = [
+                f"**Global state:** {'🟢 enabled' if global_on else '🔴 disabled'}",
+                "Notifications post inside **each voice channel's own text chat** "
+                "(all voice channels, automatically).",
+            ]
+            rows = await db.fetchall(
+                "SELECT key, value FROM guild_config WHERE guild_id=? "
+                "AND key LIKE 'vcnotify.cfg.%'",
+                (interaction.guild.id,))
+            overrides = []
+            for r in rows:
+                cid = str(r["key"]).rsplit(".", 1)[-1]
+                try:
+                    cfg = json.loads(r["value"]) if r["value"] else {}
+                except Exception:
+                    cfg = {}
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                state = "on" if cfg.get("enabled", True) else "off"
+                jm = "✏️ custom" if cfg.get("join_msg") else "default"
+                lm = "✏️ custom" if cfg.get("leave_msg") else "default"
+                overrides.append(
+                    f"• <#{cid}> | per-channel: {state} | join: {jm} | leave: {lm}")
+            if overrides:
+                lines.append("**Per-channel overrides:**")
+                lines.extend(overrides)
+            else:
+                lines.append("*(no per-channel overrides — defaults used everywhere)*")
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+        except Exception as e:
+            log.exception("vcnotify list failed")
+            await _vc_reply_error(interaction, f"❌ Failed: {e}")
 
     async def _edit_vc_msg(interaction: discord.Interaction,
                            vc: discord.VoiceChannel, key: str, title: str):
@@ -2687,20 +2685,20 @@ def register_all_commands(bot: Freakos):
     async def v_leave(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         await _edit_vc_msg(interaction, voice_channel, "leave_msg", "VC Leave Message")
 
-    @vcnotify.command(name="test", description="Post a test join + leave message.")
-    @app_commands.describe(voice_channel="Voice channel whose target to test")
+    @vcnotify.command(
+        name="test",
+        description="Post a test join + leave message in a VC's own text chat.")
+    @app_commands.describe(voice_channel="Voice channel to test")
     async def v_test(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
-        if not await require_admin(interaction):
-            return
         await interaction.response.defer(ephemeral=True)
         try:
-            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-            tgt_id = cfg.get("target_channel_id")
-            tgt = interaction.guild.get_channel(int(tgt_id)) if tgt_id else None
-            if not tgt:
+            if not interaction.guild:
+                return await interaction.followup.send("Guild only.", ephemeral=True)
+            if not is_admin_or_mod(interaction.user):
                 return await interaction.followup.send(
-                    "❌ No target text channel set for that VC. Run `/vcnotify setup`.",
-                    ephemeral=True)
+                    "You need Manage Server / Administrator.", ephemeral=True)
+
+            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
             join_tpl = cfg.get("join_msg") or "🎧 {mention} joined **{channel_name}**."
             leave_tpl = cfg.get("leave_msg") or "👋 {mention} left **{channel_name}**."
             common = dict(
@@ -2710,19 +2708,28 @@ def register_all_commands(bot: Freakos):
                 channel_name=voice_channel.name,
                 channel_mention=voice_channel.mention,
                 server=interaction.guild.name)
+
+            me = interaction.guild.me
+            perms = voice_channel.permissions_for(me) if me else None
+            if perms is None or not (perms.view_channel and perms.send_messages):
+                return await interaction.followup.send(
+                    "❌ I can't post in that voice channel's text chat. "
+                    "Give me **View Channel** and **Send Messages** for it.",
+                    ephemeral=True)
+
             for c in chunk_message("[TEST] " + apply_placeholders(join_tpl, **common)):
-                await tgt.send(c)
+                await voice_channel.send(c)
             for c in chunk_message("[TEST] " + apply_placeholders(leave_tpl, **common)):
-                await tgt.send(c)
+                await voice_channel.send(c)
             await interaction.followup.send(
-                f"✅ Test sent to {tgt.mention}.", ephemeral=True)
+                f"✅ Test sent in {voice_channel.mention}'s text chat.", ephemeral=True)
         except discord.Forbidden:
-            await interaction.followup.send(
-                f"❌ I can't post in the target channel. Check my permissions.",
-                ephemeral=True)
+            await _vc_reply_error(
+                interaction,
+                "❌ I can't post in that voice channel's text chat. Check my permissions.")
         except Exception as e:
             log.exception("vcnotify test failed")
-            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
+            await _vc_reply_error(interaction, f"❌ Failed: {e}")
 
     @vcnotify.command(name="reset", description="Wipe VC-notification config.")
     async def v_reset(interaction: discord.Interaction):
