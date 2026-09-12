@@ -478,7 +478,6 @@ class TicketPanelModal(discord.ui.Modal, title="Ticket Panel"):
         embed = make_embed(
             title=self.panel_title.value or None,
             description=self.panel_description.value or None)
-        # CHANGE: add server logo/banner image at the bottom of the panel.
         try:
             if interaction.guild and interaction.guild.icon:
                 embed.set_image(url=interaction.guild.icon.url)
@@ -568,7 +567,6 @@ async def _open_ticket(interaction: discord.Interaction, ttype: str):
     info_embed.add_field(name="𑣲 Created By", value=interaction.user.mention, inline=False)
     info_embed.add_field(name="𑣲 Created At", value=fmt_dt_human(created_at), inline=False)
 
-    # CHANGE: show ticket creator's PFP as a small thumbnail on the embed.
     try:
         if interaction.user.display_avatar:
             info_embed.set_thumbnail(url=interaction.user.display_avatar.url)
@@ -630,7 +628,6 @@ async def _post_ticket_close_log(bot: "Freakos", guild: discord.Guild, channel,
     e.add_field(name="𑣲 Close Reason", value=reason or "No reason specified", inline=False)
     e.add_field(name="𑣲 Transcript", value="Attached below ⬇", inline=False)
 
-    # CHANGE: show the closer's PFP as a small thumbnail on the log embed.
     try:
         if getattr(closed_by, "display_avatar", None):
             e.set_thumbnail(url=closed_by.display_avatar.url)
@@ -1395,6 +1392,27 @@ class Freakos(commands.Bot):
         register_all_commands(self)
         await self._restore_persistent_views()
 
+        # --- Fix for CommandSignatureMismatch ---
+        # Push current command schema to Discord so stale definitions are
+        # replaced. Without this, Discord keeps the old schema from a previous
+        # deploy and every changed command throws CommandSignatureMismatch.
+        try:
+            # Copy globals to all joined guilds first, so stale guild-scoped
+            # commands get overwritten by the fresh global set.
+            self.tree.copy_global_to(guild=None)
+            synced = await self.tree.sync()
+            log.info("Synced %d slash commands (global)", len(synced))
+        except Exception:
+            log.exception("Global command sync failed")
+            # Last-resort: try per-guild sync so commands still work.
+            for g in list(self.guilds):
+                try:
+                    self.tree.copy_global_to(guild=g)
+                    await self.tree.sync(guild=g)
+                    log.info("Synced commands for guild %s", g.id)
+                except Exception:
+                    log.exception("Guild sync failed for %s", g.id)
+
     async def _restore_persistent_views(self):
         self.add_view(TicketCreateButton())
         self.add_view(ShopPanelView())
@@ -1448,7 +1466,7 @@ class Freakos(commands.Bot):
     async def on_member_join(self, member: discord.Member):
         guild = member.guild
 
-        # --- welcome channel message (unchanged behaviour) ---
+        # --- welcome channel message ---
         if await self.db.get_config(guild.id, "welcome.enabled", "0") == "1":
             ch_id = await self.db.get_config(guild.id, "welcome.channel")
             ch = guild.get_channel(int(ch_id)) if ch_id else None
@@ -1498,7 +1516,7 @@ class Freakos(commands.Bot):
                 except Exception:
                     log.exception("Welcome send failed")
 
-        # --- welcome DM (NEW) ---
+        # --- welcome DM ---
         if await self.db.get_config(guild.id, "welcome.dm.enabled", "0") == "1":
             dm_title = await self.db.get_config(guild.id, "welcome.dm.title", "") or ""
             dm_content = await self.db.get_config(guild.id, "welcome.dm.content", "") or ""
@@ -1517,11 +1535,11 @@ class Freakos(commands.Bot):
                         dm_embed.set_thumbnail(url=guild.icon.url)
                     await member.send(embed=dm_embed)
                 except discord.Forbidden:
-                    pass  # DMs closed
+                    pass
                 except Exception:
                     log.exception("Welcome DM failed for %s", member.id)
 
-        # --- autorole (unchanged) ---
+        # --- autorole ---
         if await self.db.get_config(guild.id, "autorole.enabled", "0") == "1":
             roles = await self.db.get_json(guild.id, "autorole.roles", default=[])
             good = [guild.get_role(rid) for rid in roles]
@@ -1532,7 +1550,7 @@ class Freakos(commands.Bot):
                 except Exception:
                     log.exception("Autorole failed")
 
-        # --- autonick (unchanged) ---
+        # --- autonick ---
         if await self.db.get_config(guild.id, "autonick.enabled", "0") == "1":
             fmt = await self.db.get_config(guild.id, "autonick.format") or "{user}"
             nick = apply_placeholders(
@@ -1613,7 +1631,7 @@ class Freakos(commands.Bot):
                          f"**Before:**\n{before.content[:700]}\n"
                          f"**After:**\n{after.content[:700]}")
 
-    # ---------- VC NOTIFY (hardened) ----------
+    # ---------- VC NOTIFY ----------
 
     async def on_voice_state_update(self, member: discord.Member,
                                     before: discord.VoiceState,
@@ -1630,7 +1648,6 @@ class Freakos(commands.Bot):
             if old_id == new_id:
                 return
 
-            # Global toggle
             if await self.db.get_config(guild.id, "vcnotify.enabled", "1") == "0":
                 return
 
@@ -1638,7 +1655,7 @@ class Freakos(commands.Bot):
                 guild.id, "vcnotify.channels", default=[]) or []
             if not raw_watch:
                 return
-            # Accept both int and str IDs stored in DB.
+
             watch_ids: set[int] = set()
             for c in raw_watch:
                 try:
@@ -1873,7 +1890,6 @@ class TextModal(discord.ui.Modal):
 
 
 class WelcomeDMModal(discord.ui.Modal, title="Welcome DM Configuration"):
-    """NEW: modal to configure the DM sent to new members on join."""
     dm_title = discord.ui.TextInput(
         label="DM Title", style=discord.TextStyle.short,
         max_length=200, required=False,
@@ -1987,8 +2003,7 @@ def register_all_commands(bot: Freakos):
             "AutoMod": ["automod"],
             "Moderation": ["warn", "warnings", "clearwarnings", "timeout",
                            "untimeout", "kick", "ban", "unban", "purge",
-                           "slowmode", "lock", "unlock", "lockdown",
-                           "unlockdown"],
+                           "lock", "unlock"],
             "Logging": ["logging"],
             "Reaction Roles": ["reactionrole"],
             "Giveaways": ["giveaway"],
@@ -2106,33 +2121,6 @@ def register_all_commands(bot: Freakos):
             title="Welcome Message", default=current,
             on_submit=lambda i, v: _save_and_reply(i, "welcome.message", v)))
 
-    @welcome.command(name="embed",
-                     description="Configure the welcome embed (title, color, footer, image, thumbnail).")
-    async def w_embed(interaction: discord.Interaction,
-                      enabled: Optional[bool] = True,
-                      title: Optional[str] = None,
-                      color: Optional[str] = None,
-                      footer: Optional[str] = None,
-                      image: Optional[str] = None,
-                      thumbnail: Optional[str] = None):
-        if not await require_admin(interaction): return
-        cfg = await db.get_json(interaction.guild.id, "welcome.embed", default={}) or {}
-        cfg["enabled"] = bool(enabled)
-        if title is not None: cfg["title"] = title or ""
-        if footer is not None: cfg["footer"] = footer or ""
-        if image is not None: cfg["image"] = image or ""
-        if thumbnail is not None: cfg["thumbnail"] = thumbnail or ""
-        if color is not None:
-            try:
-                cfg["color"] = int(color.replace("#", "").replace("0x", ""), 16)
-            except Exception:
-                cfg["color"] = 0x5865F2
-        else:
-            cfg.setdefault("color", 0x5865F2)
-        await db.set_json(interaction.guild.id, "welcome.embed", cfg)
-        await interaction.response.send_message(
-            "✅ Welcome embed saved. Preview with `/welcome test`.", ephemeral=True)
-
     @welcome.command(name="test", description="Send a test welcome message/embed.")
     async def w_test(interaction: discord.Interaction):
         if not await require_admin(interaction): return
@@ -2181,8 +2169,6 @@ def register_all_commands(bot: Freakos):
             for c in chunk_message(rendered):
                 await ch.send(c)
         await interaction.response.send_message("✅ Test sent.", ephemeral=True)
-
-    # ---------- NEW: Welcome DM ----------
 
     @welcome.command(name="dm-setup",
                      description="Open a popup to configure the DM sent to new members.")
@@ -2796,37 +2782,6 @@ def register_all_commands(bot: Freakos):
         await db.set_config(interaction.guild.id, "ticket.member_can_close",
                             "1" if enabled else "0")
         await interaction.response.send_message("✅ Saved.", ephemeral=True)
-
-    @ticket.command(name="button", description="Customize an inner-ticket button.")
-    @app_commands.choices(button=[
-        app_commands.Choice(name="Close", value="close"),
-        app_commands.Choice(name="Close With Reason", value="close_reason"),
-        app_commands.Choice(name="Claim / Unclaim", value="claim"),
-        app_commands.Choice(name="Add User", value="add_user"),
-        app_commands.Choice(name="Remove User", value="remove_user"),
-        app_commands.Choice(name="Lock", value="lock"),
-        app_commands.Choice(name="Unlock", value="unlock"),
-        app_commands.Choice(name="Transcript", value="transcript"),
-        app_commands.Choice(name="Notify", value="notify"),
-    ])
-    async def t_button(interaction: discord.Interaction,
-                       button: app_commands.Choice[str],
-                       enabled: Optional[bool] = None,
-                       label: Optional[str] = None,
-                       emoji: Optional[str] = None,
-                       style: Optional[str] = None):
-        if not await require_admin(interaction): return
-        stored = await db.get_json(interaction.guild.id, "ticket.room_buttons", default={})
-        entry = dict(stored.get(button.value, {}))
-        if enabled is not None: entry["enabled"] = enabled
-        if label is not None: entry["label"] = label[:80]
-        if emoji is not None: entry["emoji"] = emoji
-        if style is not None and style.lower() in _BUTTON_STYLES:
-            entry["style"] = style.lower()
-        stored[button.value] = entry
-        await db.set_json(interaction.guild.id, "ticket.room_buttons", stored)
-        await interaction.response.send_message(
-            f"✅ Updated the `{button.name}` button.", ephemeral=True)
 
     @ticket.command(name="claim", description="Claim current ticket.")
     async def t_claim(interaction: discord.Interaction):
