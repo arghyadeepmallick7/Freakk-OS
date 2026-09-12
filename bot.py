@@ -266,6 +266,13 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     completed INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(completed, run_at);
+CREATE TABLE IF NOT EXISTS automod_violations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL, rule TEXT NOT NULL, action TEXT,
+    channel_id INTEGER, reason TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_automod_guild ON automod_violations(guild_id);
+CREATE INDEX IF NOT EXISTS idx_automod_user ON automod_violations(guild_id, user_id);
 """
 
 
@@ -1241,6 +1248,427 @@ async def _log_guild(bot: "Freakos", guild: discord.Guild, event_key: str,
 
 
 # =====================================================================
+# AutoMod engine
+# =====================================================================
+
+AM_RULES = ["spam", "links", "invites", "words", "mentions", "caps",
+            "emojis", "characters", "everyone", "raid", "accounts", "antinuke"]
+AM_ACTIONS = ("delete", "warn", "timeout", "kick", "ban")
+AM_ACTION_SEVERITY = {"delete": 0, "warn": 1, "timeout": 2, "kick": 3, "ban": 4}
+
+AM_DEFAULT_RULES = {
+    "spam": {"enabled": True, "action": "delete", "max_messages": 5, "window": 5,
+             "duplicate_enabled": True, "duplicate_count": 3, "duplicate_window": 12},
+    "links": {"enabled": False, "action": "delete", "mode": "blacklist",
+              "blacklist": [], "allowlist": []},
+    "invites": {"enabled": True, "action": "delete"},
+    "words": {"enabled": True, "action": "delete", "words": [], "match": "partial"},
+    "mentions": {"enabled": True, "action": "delete", "max_mentions": 6,
+                 "max_role_mentions": 4},
+    "caps": {"enabled": False, "action": "delete", "percent": 70, "min_length": 12},
+    "emojis": {"enabled": False, "action": "delete", "max_emojis": 6},
+    "characters": {"enabled": False, "action": "delete", "max_repeat": 8},
+    "everyone": {"enabled": True, "action": "delete"},
+    "raid": {"enabled": False, "action": "kick", "max_joins": 6, "window": 12},
+    "accounts": {"enabled": False, "action": "kick", "min_age_days": 7},
+    "antinuke": {"enabled": False, "action": "ban", "max_deletes": 3, "window": 30},
+}
+
+AM_DEFAULT_MESSAGE = ("{mention} your message was removed.\n"
+                      "**Rule:** `{rule}` · **Action:** `{action}`")
+
+AM_INVITE_RE = re.compile(
+    r"(?:discord\.gg|discord(?:app)?\.com/invite)/[A-Za-z0-9\-]+", re.I)
+AM_URL_RE = re.compile(r"(?:https?://|www\.)[^\s<]+", re.I)
+AM_CUSTOM_EMOJI_RE = re.compile(r"<a?:[A-Za-z0-9_]{2,32}:[0-9]{15,25}>")
+AM_UNICODE_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF\U0000FE00-\U0000FE0F]")
+
+
+def _am_default_config() -> dict:
+    rules = {}
+    for k, v in AM_DEFAULT_RULES.items():
+        rules[k] = {kk: (list(vv) if isinstance(vv, list) else vv)
+                    for kk, vv in v.items()}
+    return {
+        "rules": rules,
+        "whitelist": {"users": [], "roles": [], "channels": []},
+        "rule_whitelist": {},
+        "messages": {"violation": AM_DEFAULT_MESSAGE, "delete_after": 8, "dm": False},
+        "timeout_duration": 600,
+        "logs": {"enabled": True, "channel": None},
+    }
+
+
+def _am_int_list(v) -> list:
+    out = []
+    if isinstance(v, list):
+        for x in v:
+            try:
+                out.append(int(x))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _am_merge_defaults(stored: dict) -> dict:
+    cfg = _am_default_config()
+    if not isinstance(stored, dict):
+        return cfg
+    sr = stored.get("rules") if isinstance(stored.get("rules"), dict) else {}
+    legacy_action = stored.get("_legacy_action")
+    for name in AM_RULES:
+        got = sr.get(name)
+        if isinstance(got, dict):
+            cfg["rules"][name].update(got)
+    if legacy_action in AM_ACTIONS:
+        for name in AM_RULES:
+            got = sr.get(name)
+            if not isinstance(got, dict) or "action" not in got:
+                cfg["rules"][name]["action"] = legacy_action
+    if isinstance(stored.get("whitelist"), dict):
+        for k in ("users", "roles", "channels"):
+            cfg["whitelist"][k] = _am_int_list(stored["whitelist"].get(k))
+    if isinstance(stored.get("rule_whitelist"), dict):
+        for rule, wl in stored["rule_whitelist"].items():
+            if isinstance(wl, dict):
+                cfg["rule_whitelist"][rule] = {
+                    k: _am_int_list(wl.get(k)) for k in ("users", "roles", "channels")}
+    if isinstance(stored.get("messages"), dict):
+        cfg["messages"].update(stored["messages"])
+    try:
+        if stored.get("timeout_duration") is not None:
+            cfg["timeout_duration"] = int(stored["timeout_duration"])
+    except (TypeError, ValueError):
+        pass
+    if isinstance(stored.get("logs"), dict):
+        cfg["logs"].update(stored["logs"])
+    return cfg
+
+
+async def am_load_config(db: "Database", guild_id: int) -> dict:
+    stored = await db.get_json(guild_id, "automod.config", default=None)
+    need_save = False
+    if not isinstance(stored, dict):
+        stored = {}
+        old = await db.get_json(guild_id, "automod.settings", default=None)
+        oldwl = await db.get_json(guild_id, "automod.whitelist", default=None)
+        if isinstance(old, dict) and old:
+            need_save = True
+            rules: dict = {}
+            if "antispam" in old:
+                rules["spam"] = {"enabled": bool(old["antispam"])}
+            if "links" in old:
+                rules["links"] = {"enabled": bool(old["links"])}
+            if "invites" in old:
+                rules["invites"] = {"enabled": bool(old["invites"])}
+            if "mentions" in old:
+                rules["mentions"] = {"enabled": bool(old["mentions"])}
+            if isinstance(old.get("words"), list) and old["words"]:
+                rules["words"] = {"enabled": True,
+                                  "words": [str(w) for w in old["words"]]}
+            stored["rules"] = rules
+            if old.get("action") in AM_ACTIONS:
+                stored["_legacy_action"] = old["action"]
+        if isinstance(oldwl, dict) and oldwl:
+            need_save = True
+            stored["whitelist"] = oldwl
+    cfg = _am_merge_defaults(stored)
+    cfg["_master"] = (await db.get_config(guild_id, "automod.enabled", "0") == "1")
+    if need_save:
+        await am_save_config(db, guild_id, cfg)
+    return cfg
+
+
+async def am_save_config(db: "Database", guild_id: int, cfg: dict):
+    clean = {k: v for k, v in cfg.items() if not str(k).startswith("_")}
+    await db.set_json(guild_id, "automod.config", clean)
+
+
+def am_rule(cfg: dict, name: str) -> dict:
+    return cfg.setdefault("rules", {}).setdefault(name, dict(AM_DEFAULT_RULES.get(name, {})))
+
+
+def _am_wl_hit(wl: dict, member, channel) -> bool:
+    if not isinstance(wl, dict):
+        return False
+    try:
+        if member is not None and member.id in _am_int_list(wl.get("users")):
+            return True
+        if member is not None:
+            rids = set(_am_int_list(wl.get("roles")))
+            for r in getattr(member, "roles", []) or []:
+                if getattr(r, "id", None) in rids:
+                    return True
+        if channel is not None:
+            cid = getattr(channel, "id", None)
+            if cid is not None and cid in _am_int_list(wl.get("channels")):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def am_global_whitelisted(cfg: dict, member, channel) -> bool:
+    return _am_wl_hit(cfg.get("whitelist", {}), member, channel)
+
+
+def am_rule_whitelisted(cfg: dict, rule: str, member, channel) -> bool:
+    return _am_wl_hit((cfg.get("rule_whitelist", {}) or {}).get(rule, {}),
+                      member, channel)
+
+
+def am_domains(content: str) -> list:
+    out = []
+    for url in AM_URL_RE.findall(content or ""):
+        u = url.lower().rstrip(").,>]}\"'")
+        if u.startswith("www."):
+            u = u[4:]
+        elif "://" in u:
+            u = u.split("://", 1)[1]
+        host = u.split("/", 1)[0].split("?", 1)[0]
+        if host:
+            out.append(host)
+    return out
+
+
+def am_count_emojis(content: str) -> int:
+    if not content:
+        return 0
+    return len(AM_CUSTOM_EMOJI_RE.findall(content)) + \
+        len(AM_UNICODE_EMOJI_RE.findall(content))
+
+
+def am_caps_ratio(content: str) -> float:
+    letters = [c for c in (content or "") if c.isalpha()]
+    if not letters:
+        return 0.0
+    upper = sum(1 for c in letters if c.isupper())
+    return (upper / len(letters)) * 100.0
+
+
+def am_repeat_hit(content: str, max_repeat: int) -> bool:
+    if not content:
+        return False
+    try:
+        n = int(max_repeat)
+    except (TypeError, ValueError):
+        n = 8
+    if n < 2:
+        return False
+    return bool(re.search(r"(.)\1{" + str(n - 1) + r",}", content))
+
+
+def am_timeout_seconds(cfg: dict, rule_name: str) -> int:
+    r = (cfg.get("rules", {}) or {}).get(rule_name, {}) or {}
+    for src in (r.get("timeout_duration"), cfg.get("timeout_duration"), 600):
+        try:
+            v = int(src)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            continue
+    return 600
+
+
+async def am_record_violation(db: "Database", guild_id: int, user_id: int,
+                              rule: str, action: str, channel_id, reason: str):
+    try:
+        await db.execute(
+            "INSERT INTO automod_violations (guild_id, user_id, rule, action, "
+            "channel_id, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, rule, action, channel_id,
+             (reason or "")[:500], iso(now_utc())))
+    except Exception:
+        log.exception("automod: failed to record violation")
+
+
+async def am_log(bot: "Freakos", guild: discord.Guild, title: str,
+                 description: str, color: int = 0xE67E22, cfg: dict = None):
+    if not guild:
+        return
+    try:
+        if cfg is None:
+            cfg = await am_load_config(bot.db, guild.id)
+        logs = cfg.get("logs", {}) or {}
+        if not logs.get("enabled", True):
+            return
+        ch_id = logs.get("channel")
+        ch = guild.get_channel(int(ch_id)) if ch_id else None
+        if ch:
+            try:
+                await ch.send(embed=make_embed(
+                    title=title, description=(description or "")[:4000], color=color))
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Fall back to the existing logging system.
+    await _log_guild(bot, guild, "automod", title, description, color)
+
+
+def am_render_violation(cfg: dict, member, guild, rule: str,
+                        action: str, reason: str) -> str:
+    tpl = (cfg.get("messages", {}) or {}).get("violation") or AM_DEFAULT_MESSAGE
+    return apply_placeholders(
+        tpl, user=getattr(member, "name", str(member)),
+        mention=getattr(member, "mention", str(member)),
+        username=getattr(member, "name", str(member)),
+        display_name=getattr(member, "display_name", getattr(member, "name", "")),
+        server=getattr(guild, "name", ""), rule=rule, action=action, reason=reason)
+
+
+async def _am_action_dm(bot: "Freakos", guild: discord.Guild, member,
+                        template_key: str, **extra):
+    try:
+        if await bot.db.get_config(guild.id, "actiondm.enabled", "0") != "1":
+            return
+        msg = await bot.db.get_config(guild.id, template_key)
+        if not msg:
+            return
+        rendered = apply_placeholders(
+            msg, user=member.name, mention=member.mention,
+            username=member.name, display_name=member.display_name,
+            server=guild.name, timestamp=fmt_dt(now_utc()), **extra)
+        for c in chunk_message(rendered):
+            await member.send(c)
+    except Exception:
+        pass
+
+
+async def am_punish(bot: "Freakos", guild: discord.Guild, member, action: str,
+                    reason: str, rule_name: str, cfg: dict,
+                    message: discord.Message = None) -> bool:
+    """Apply a single AutoMod punishment safely. Returns True if action applied."""
+    # --- Safety gates: never punish bots, self, owner, or administrators. ---
+    if guild is None or member is None:
+        return False
+    if getattr(member, "bot", False):
+        return False
+    if bot.user is not None and member.id == bot.user.id:
+        return False
+    if member.id == guild.owner_id:
+        return False
+    perms = getattr(member, "guild_permissions", None)
+    if perms is not None and getattr(perms, "administrator", False):
+        return False
+
+    # Delete the offending message first (applies to every action).
+    if message is not None:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    action = (action or "delete").lower()
+    if action not in AM_ACTIONS:
+        action = "delete"
+
+    ch_id = getattr(getattr(message, "channel", None), "id", None)
+    full_reason = f"AutoMod [{rule_name}]: {reason}"[:500]
+    await am_record_violation(bot.db, guild.id, member.id, rule_name,
+                              action, ch_id, reason)
+
+    if action == "delete":
+        return True
+
+    if not isinstance(member, discord.Member):
+        return False
+    ok, why = hierarchy_ok(guild, member)
+    if not ok:
+        await am_log(bot, guild, "AutoMod",
+                     f"⚠️ Could not punish {member.mention} (`{rule_name}`): {why}",
+                     0xE67E22, cfg=cfg)
+        return False
+
+    me = guild.me
+    bot_id = bot.user.id if bot.user else 0
+    try:
+        if action == "warn":
+            await bot.db.execute(
+                "INSERT INTO warnings (guild_id, user_id, moderator_id, reason, "
+                "created_at) VALUES (?, ?, ?, ?, ?)",
+                (guild.id, member.id, bot_id, full_reason, iso(now_utc())))
+            await bot.db.execute(
+                "INSERT INTO cases (guild_id, user_id, moderator_id, action, "
+                "reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (guild.id, member.id, bot_id, "warn", full_reason, iso(now_utc())))
+            return True
+
+        if action == "timeout":
+            if me is None or not me.guild_permissions.moderate_members:
+                await am_log(bot, guild, "AutoMod",
+                             f"⚠️ Missing **Moderate Members** to timeout {member.mention}.",
+                             0xE67E22, cfg=cfg)
+                return False
+            secs = max(1, min(am_timeout_seconds(cfg, rule_name), 28 * 86400))
+            until = now_utc() + timedelta(seconds=secs)
+            await member.timeout(timedelta(seconds=secs), reason=full_reason)
+            await bot.db.execute(
+                "INSERT INTO cases (guild_id, user_id, moderator_id, action, "
+                "reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (guild.id, member.id, bot_id, "timeout", full_reason, iso(now_utc())))
+            tid = await bot.db.execute(
+                "INSERT INTO timeouts (guild_id, user_id, moderator_id, reason, "
+                "ends_at) VALUES (?, ?, ?, ?, ?)",
+                (guild.id, member.id, bot_id, full_reason, iso(until)))
+            try:
+                await bot.scheduler.schedule(
+                    "timeout_end", until + timedelta(seconds=5),
+                    {"timeout_id": tid}, guild.id)
+            except Exception:
+                pass
+            await _am_action_dm(bot, guild, member, "actiondm.timeout_msg",
+                                moderator=f"<@{bot_id}>", reason=full_reason,
+                                duration=fmt_duration(secs),
+                                timeout_end=fmt_dt(until))
+            return True
+
+        if action == "kick":
+            if me is None or not me.guild_permissions.kick_members:
+                await am_log(bot, guild, "AutoMod",
+                             f"⚠️ Missing **Kick Members** to kick {member.mention}.",
+                             0xE67E22, cfg=cfg)
+                return False
+            await bot.db.execute(
+                "INSERT INTO cases (guild_id, user_id, moderator_id, action, "
+                "reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (guild.id, member.id, bot_id, "kick", full_reason, iso(now_utc())))
+            await _am_action_dm(bot, guild, member, "actiondm.kick_msg",
+                                moderator=f"<@{bot_id}>", reason=full_reason)
+            await member.kick(reason=full_reason)
+            return True
+
+        if action == "ban":
+            if me is None or not me.guild_permissions.ban_members:
+                await am_log(bot, guild, "AutoMod",
+                             f"⚠️ Missing **Ban Members** to ban {member.mention}.",
+                             0xE67E22, cfg=cfg)
+                return False
+            await bot.db.execute(
+                "INSERT INTO cases (guild_id, user_id, moderator_id, action, "
+                "reason, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (guild.id, member.id, bot_id, "ban", full_reason, iso(now_utc())))
+            await _am_action_dm(bot, guild, member, "actiondm.ban_msg",
+                                moderator=f"<@{bot_id}>", reason=full_reason)
+            try:
+                await member.ban(reason=full_reason, delete_message_seconds=86400)
+            except TypeError:
+                await member.ban(reason=full_reason, delete_message_days=1)
+            return True
+    except discord.Forbidden:
+        await am_log(bot, guild, "AutoMod",
+                     f"⚠️ Forbidden while applying `{action}` to {member.mention} "
+                     f"(`{rule_name}`). Check permissions/hierarchy.",
+                     0xE67E22, cfg=cfg)
+    except Exception:
+        log.exception("automod punishment failed (action=%s rule=%s)", action, rule_name)
+    return False
+
+
+# =====================================================================
 # Scheduler-driven tasks
 # =====================================================================
 
@@ -1384,6 +1812,11 @@ class Freakos(commands.Bot):
         self.scheduler: Optional[Scheduler] = None
         self._spam_tracker: dict[tuple, list[float]] = {}
         self._notify_cooldown: dict[int, float] = {}
+        # AutoMod in-memory trackers (rate-based only; config/stats persist in DB)
+        self._am_rate: dict[tuple, list[float]] = {}
+        self._am_dup: dict[tuple, list[tuple]] = {}
+        self._am_joins: dict[int, list[float]] = {}
+        self._am_nuke: dict[tuple, list[float]] = {}
 
     async def setup_hook(self):
         await self.db.connect()
@@ -1556,8 +1989,17 @@ class Freakos(commands.Bot):
         await _log_guild(self, guild, "joins", "Member Joined",
                          f"{member.mention} ({member})")
 
+        try:
+            await self._automod_join_check(member)
+        except Exception:
+            log.exception("automod join check failed")
+
     async def on_member_remove(self, member: discord.Member):
         guild = member.guild
+        try:
+            await self._automod_leave_check(member)
+        except Exception:
+            log.exception("automod leave check failed")
         if await self.db.get_config(guild.id, "departure.enabled", "0") == "1":
             ch_id = await self.db.get_config(guild.id, "departure.channel")
             ch = guild.get_channel(int(ch_id)) if ch_id else None
@@ -1728,97 +2170,337 @@ class Freakos(commands.Bot):
 
     async def _automod_check(self, message: discord.Message):
         guild = message.guild
-        if await self.db.get_config(guild.id, "automod.enabled", "0") != "1":
+        if guild is None:
             return
-        if message.author.guild_permissions.administrator:
+        author = message.author
+        if author.bot or (self.user and author.id == self.user.id):
             return
-        if message.author.id == self.user.id:
+        if not isinstance(author, discord.Member):
             return
-        whitelist = await self.db.get_json(guild.id, "automod.whitelist", default={})
-        wl_channels = set(whitelist.get("channels", []))
-        wl_roles = set(whitelist.get("roles", []))
-        if message.channel.id in wl_channels:
-            return
-        if any(r.id in wl_roles for r in message.author.roles):
+        # Never auto-moderate the owner or administrators.
+        if author.id == guild.owner_id or author.guild_permissions.administrator:
             return
 
-        settings = await self.db.get_json(guild.id, "automod.settings", default={})
-        action = settings.get("action", "delete")
-        violations = []
+        cfg = await am_load_config(self.db, guild.id)
+        if not cfg.get("_master"):
+            return
+        channel = message.channel
+        if am_global_whitelisted(cfg, author, channel):
+            return
 
-        if settings.get("invites", True) and re.search(
-                r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+",
-                message.content, re.I):
-            violations.append("invite link")
-        if settings.get("links", True) and re.search(
-                r"https?://\S+", message.content, re.I):
-            if not re.search(
-                    r"(discord\.gg|discord\.com/invite|discordapp\.com/invite)/\S+",
-                    message.content, re.I):
-                violations.append("link")
+        content = message.content or ""
+        rules = cfg.get("rules", {})
+        matches: list = []
 
-        low = message.content.lower()
-        for w in settings.get("words", []):
-            if w and w.lower() in low:
-                violations.append(f"banned word `{w}`")
-                break
+        def _add(name: str, reason: str):
+            r = rules.get(name, {}) or {}
+            matches.append((name, r.get("action", "delete"), reason))
 
-        if settings.get("mentions", True) and len(message.mentions) >= 5:
-            violations.append("mention spam")
+        def _blocked(name: str) -> bool:
+            return am_rule_whitelisted(cfg, name, author, channel)
 
-        if settings.get("antispam", True):
-            key = (guild.id, message.author.id)
+        def _int(d: dict, k: str, default: int) -> int:
+            try:
+                return int(d.get(k, default))
+            except (TypeError, ValueError):
+                return default
+
+        # --- @everyone / @here protection ---
+        ev = rules.get("everyone", {}) or {}
+        if ev.get("enabled") and not _blocked("everyone") and message.mention_everyone:
+            if not author.guild_permissions.mention_everyone:
+                _add("everyone", "used @everyone/@here without permission")
+
+        # --- Discord invites ---
+        inv = rules.get("invites", {}) or {}
+        if inv.get("enabled") and not _blocked("invites") and AM_INVITE_RE.search(content):
+            _add("invites", "posted a Discord invite link")
+
+        # --- Links (all / blacklist / whitelist) ---
+        lk = rules.get("links", {}) or {}
+        if lk.get("enabled") and not _blocked("links"):
+            doms = am_domains(content)
+            if doms:
+                mode = (lk.get("mode") or "blacklist").lower()
+                bl = [str(d).lower() for d in (lk.get("blacklist") or [])]
+                alw = [str(d).lower() for d in (lk.get("allowlist") or [])]
+                hit = False
+                if mode == "all":
+                    hit = True
+                elif mode == "blacklist":
+                    hit = any(any(d == b or d.endswith("." + b) for b in bl) for d in doms)
+                elif mode == "whitelist":
+                    hit = any(not any(d == a or d.endswith("." + a) for a in alw)
+                              for d in doms)
+                if hit:
+                    _add("links", f"posted a disallowed link ({', '.join(doms[:3])})")
+
+        # --- Banned words (exact / partial) ---
+        wd = rules.get("words", {}) or {}
+        if wd.get("enabled") and not _blocked("words"):
+            low = content.lower()
+            exact = (wd.get("match") or "partial").lower() == "exact"
+            for w in (wd.get("words") or []):
+                w = str(w).strip()
+                if not w:
+                    continue
+                wl = w.lower()
+                if exact:
+                    if re.search(r"(?<!\w)" + re.escape(wl) + r"(?!\w)", low):
+                        _add("words", f"used banned word `{w}`")
+                        break
+                elif wl in low:
+                    _add("words", f"used banned word `{w}`")
+                    break
+
+        # --- Mention spam / role-mention limits ---
+        mn = rules.get("mentions", {}) or {}
+        if mn.get("enabled") and not _blocked("mentions"):
+            max_m = _int(mn, "max_mentions", 6)
+            max_rm = _int(mn, "max_role_mentions", 4)
+            if len(message.mentions) >= max_m:
+                _add("mentions", f"mentioned {len(message.mentions)} users")
+            elif len(message.role_mentions) >= max_rm:
+                _add("mentions", f"mentioned {len(message.role_mentions)} roles")
+
+        # --- Excessive caps ---
+        cp = rules.get("caps", {}) or {}
+        if cp.get("enabled") and not _blocked("caps"):
+            min_len = _int(cp, "min_length", 12)
+            try:
+                pct = float(cp.get("percent", 70))
+            except (TypeError, ValueError):
+                pct = 70.0
+            if len(content) >= min_len and am_caps_ratio(content) >= pct:
+                _add("caps", "excessive capital letters")
+
+        # --- Emoji spam (unicode + custom) ---
+        em = rules.get("emojis", {}) or {}
+        if em.get("enabled") and not _blocked("emojis"):
+            n = am_count_emojis(content)
+            if n >= _int(em, "max_emojis", 6):
+                _add("emojis", f"used {n} emojis")
+
+        # --- Repeated-character spam ---
+        chr_ = rules.get("characters", {}) or {}
+        if chr_.get("enabled") and not _blocked("characters"):
+            if am_repeat_hit(content, _int(chr_, "max_repeat", 8)):
+                _add("characters", "repeated characters")
+
+        # --- Spam (rate) + duplicate/repeated spam ---
+        sp = rules.get("spam", {}) or {}
+        if sp.get("enabled") and not _blocked("spam"):
             now = now_utc().timestamp()
-            arr = self._spam_tracker.setdefault(key, [])
+            key = (guild.id, author.id)
+            win = max(1, _int(sp, "window", 5))
+            max_msgs = max(2, _int(sp, "max_messages", 5))
+            arr = self._am_rate.setdefault(key, [])
             arr.append(now)
-            self._spam_tracker[key] = [t for t in arr if now - t < 5]
-            if len(self._spam_tracker[key]) >= 6:
-                violations.append("spam")
-                self._spam_tracker[key] = []
+            self._am_rate[key] = [t for t in arr if now - t <= win]
+            if len(self._am_rate[key]) >= max_msgs:
+                _add("spam", f"sent {len(self._am_rate[key])} messages in {win}s")
+                self._am_rate[key] = []
+            if sp.get("duplicate_enabled", True):
+                dwin = max(1, _int(sp, "duplicate_window", 12))
+                dcount = max(2, _int(sp, "duplicate_count", 3))
+                sig = content.strip().lower()
+                if sig:
+                    darr = self._am_dup.setdefault(key, [])
+                    darr.append((now, sig))
+                    self._am_dup[key] = [(t, c) for (t, c) in darr if now - t <= dwin]
+                    same = sum(1 for (_t, c) in self._am_dup[key] if c == sig)
+                    if same >= dcount:
+                        _add("spam", f"repeated the same message {same}×")
+                        self._am_dup[key] = []
 
-        if not violations:
+        if not matches:
             return
 
+        # Apply ONLY the strongest configured violation (no stacked punishments).
+        matches.sort(key=lambda m: AM_ACTION_SEVERITY.get(m[1], 0), reverse=True)
+        rule_name, action, reason = matches[0]
+
+        await am_punish(self, guild, author, action, reason,
+                        rule_name, cfg, message=message)
+
+        # Customizable public violation message.
         try:
-            if action in ("delete", "warn", "timeout", "kick", "ban"):
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-            if action == "warn":
-                await self.db.execute(
-                    "INSERT INTO warnings (guild_id, user_id, moderator_id, "
-                    "reason, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (guild.id, message.author.id, self.user.id,
-                     f"AutoMod: {', '.join(violations)}", iso(now_utc())))
-                try:
-                    await message.channel.send(
-                        f"{message.author.mention} warning: {', '.join(violations)}",
-                        delete_after=5)
-                except Exception:
-                    pass
-            elif action == "timeout":
-                try:
-                    await message.author.timeout(
-                        timedelta(minutes=10), reason=f"AutoMod: {violations}")
-                except Exception:
-                    pass
-            elif action == "kick":
-                try:
-                    await message.author.kick(reason=f"AutoMod: {violations}")
-                except Exception:
-                    pass
-            elif action == "ban":
-                try:
-                    await message.author.ban(
-                        reason=f"AutoMod: {violations}", delete_message_days=1)
-                except Exception:
-                    pass
-            await _log_guild(self, guild, "automod", "AutoMod Action",
-                             f"{message.author.mention}: {', '.join(violations)} "
-                             f"(action: {action})", color=0xE67E22)
+            tpl = (cfg.get("messages", {}) or {}).get("violation")
+            if tpl:
+                rendered = am_render_violation(cfg, author, guild,
+                                               rule_name, action, reason)
+                if rendered.strip():
+                    da = _int(cfg.get("messages", {}) or {}, "delete_after", 8)
+                    await channel.send(rendered, delete_after=(da if da > 0 else None))
         except Exception:
-            log.exception("automod action failed")
+            pass
+
+        await am_log(
+            self, guild, "AutoMod Action",
+            f"**User:** {author.mention} ({author})\n"
+            f"**Channel:** {getattr(channel, 'mention', channel)}\n"
+            f"**Rule:** `{rule_name}`\n**Action:** `{action}`\n"
+            f"**Reason:** {reason}", 0xE67E22, cfg=cfg)
+
+    async def _automod_join_check(self, member: discord.Member):
+        """Raid protection (joins per window) + new-account protection."""
+        guild = member.guild
+        if getattr(member, "bot", False):
+            return
+        cfg = await am_load_config(self.db, guild.id)
+        if not cfg.get("_master"):
+            return
+        rules = cfg.get("rules", {})
+        now = now_utc()
+        ts = now.timestamp()
+
+        def _int(d: dict, k: str, default: int) -> int:
+            try:
+                return int(d.get(k, default))
+            except (TypeError, ValueError):
+                return default
+
+        # --- Raid protection ---
+        rd = rules.get("raid", {}) or {}
+        if rd.get("enabled") and not am_rule_whitelisted(cfg, "raid", member, None):
+            win = max(1, _int(rd, "window", 12))
+            max_j = max(2, _int(rd, "max_joins", 6))
+            arr = self._am_joins.setdefault(guild.id, [])
+            arr.append(ts)
+            self._am_joins[guild.id] = [t for t in arr if ts - t <= win]
+            if len(self._am_joins[guild.id]) >= max_j:
+                reason = f"raid: {len(self._am_joins[guild.id])} joins in {win}s"
+                self._am_joins[guild.id] = []
+                await am_punish(self, guild, member, rd.get("action", "kick"),
+                                reason, "raid", cfg)
+                await am_log(self, guild, "AutoMod · Raid",
+                             f"{member.mention} ({member}) — {reason}",
+                             0xE74C3C, cfg=cfg)
+                return
+
+        # --- New-account / account-age protection ---
+        ac = rules.get("accounts", {}) or {}
+        if ac.get("enabled") and not am_rule_whitelisted(cfg, "accounts", member, None):
+            min_age = max(0, _int(ac, "min_age_days", 7))
+            created = getattr(member, "created_at", None)
+            if created is not None:
+                age_days = (now - created).total_seconds() / 86400.0
+                if age_days < min_age:
+                    reason = f"account younger than {min_age}d (age {age_days:.1f}d)"
+                    await am_punish(self, guild, member, ac.get("action", "kick"),
+                                    reason, "accounts", cfg)
+                    await am_log(self, guild, "AutoMod · New Account",
+                                 f"{member.mention} ({member}) — {reason}",
+                                 0xE74C3C, cfg=cfg)
+
+    async def _automod_leave_check(self, member: discord.Member):
+        """Detect kicks via audit log for anti-nuke."""
+        await self._am_nuke_check(
+            member.guild, discord.AuditLogAction.member_kick, "Kick",
+            f"kicked {member.mention} ({member})")
+
+    async def _am_nuke_check(self, guild: discord.Guild, audit_action,
+                             event_label: str, target_desc: str):
+        """Identify a destructive actor from the audit log and act conservatively.
+
+        Never punishes the bot itself, the owner, administrators, or bots.
+        """
+        cfg = await am_load_config(self.db, guild.id)
+        if not cfg.get("_master"):
+            return
+        nk = (cfg.get("rules", {}) or {}).get("antinuke", {}) or {}
+        if not nk.get("enabled"):
+            return
+        me = guild.me
+        if me is None or not me.guild_permissions.view_audit_log:
+            return
+
+        def _int(d: dict, k: str, default: int) -> int:
+            try:
+                return int(d.get(k, default))
+            except (TypeError, ValueError):
+                return default
+
+        actor = None
+        try:
+            async for entry in guild.audit_log(action=audit_action, limit=1):
+                if entry.user is not None and \
+                        (now_utc() - entry.created_at).total_seconds() <= 15:
+                    actor = entry.user
+                break
+        except Exception:
+            return
+        if actor is None:
+            return
+        if self.user is not None and actor.id == self.user.id:
+            return
+        if getattr(actor, "bot", False):
+            return
+        if isinstance(actor, discord.Member):
+            if actor.id == guild.owner_id or actor.guild_permissions.administrator:
+                return
+        if actor.id == guild.owner_id:
+            return
+
+        win = max(1, _int(nk, "window", 30))
+        threshold = max(1, _int(nk, "max_deletes", 3))
+        now_ts = now_utc().timestamp()
+        key = (guild.id, actor.id)
+        arr = self._am_nuke.setdefault(key, [])
+        arr.append(now_ts)
+        self._am_nuke[key] = [t for t in arr if now_ts - t <= win]
+        count = len(self._am_nuke[key])
+
+        if count < threshold:
+            await am_log(self, guild, f"AutoMod · Anti-Nuke ({event_label})",
+                         f"{actor.mention} — {target_desc}", 0xE74C3C, cfg=cfg)
+            return
+
+        self._am_nuke[key] = []
+        action = nk.get("action", "ban")
+        reason = f"anti-nuke: {count} destructive actions ({event_label}) in {win}s"
+        target = actor if isinstance(actor, discord.Member) \
+            else guild.get_member(actor.id)
+        if isinstance(target, discord.Member):
+            await am_punish(self, guild, target, action, reason, "antinuke", cfg)
+        else:
+            await am_record_violation(self.db, guild.id, actor.id, "antinuke",
+                                      action, None, reason)
+            try:
+                if action == "ban" and me.guild_permissions.ban_members:
+                    await guild.ban(discord.Object(id=actor.id), reason=reason)
+            except Exception:
+                pass
+        await am_log(self, guild, f"AutoMod · Anti-Nuke ({event_label})",
+                     f"**Actor:** {actor.mention}\n**Action:** `{action}`\n"
+                     f"{target_desc}", 0xE74C3C, cfg=cfg)
+
+    async def on_guild_channel_delete(self, channel):
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return
+        try:
+            await self._am_nuke_check(
+                guild, discord.AuditLogAction.channel_delete, "Channel Delete",
+                f"deleted channel `#{getattr(channel, 'name', channel)}`")
+        except Exception:
+            log.exception("automod anti-nuke (channel delete) failed")
+
+    async def on_guild_role_delete(self, role):
+        try:
+            await self._am_nuke_check(
+                role.guild, discord.AuditLogAction.role_delete, "Role Delete",
+                f"deleted role `{role.name}`")
+        except Exception:
+            log.exception("automod anti-nuke (role delete) failed")
+
+    async def on_member_ban(self, guild: discord.Guild, user):
+        try:
+            await self._am_nuke_check(
+                guild, discord.AuditLogAction.ban, "Ban",
+                f"banned {user.mention} ({user})")
+        except Exception:
+            log.exception("automod anti-nuke (ban) failed")
 
     async def on_app_command_error(self, interaction: discord.Interaction,
                                    error: app_commands.AppCommandError):
@@ -1926,18 +2608,11 @@ def register_all_commands(bot: Freakos):
     @tree.error
     async def _on_command_error(interaction: discord.Interaction,
                                 error: app_commands.AppCommandError):
-        # Catches errors raised BEFORE a command acknowledges the interaction
-        # (e.g. a channel option that fails to resolve). Without this, Discord
-        # shows the generic "The application did not respond".
-        log.exception("Slash command error", exc_info=error)
-        msg = f"❌ Something went wrong: {error}"
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            log.exception("Failed to report command error to user")
+        # discord.py 2.x does NOT dispatch on_app_command_error automatically —
+        # the tree error hook is the only place app-command errors surface, so
+        # route it to the rich client handler (which also answers the
+        # interaction to avoid "The application did not respond").
+        await bot.on_app_command_error(interaction, error)
 
     # ---------------- GENERAL ----------------
     @tree.command(name="ping", description="Show bot latency.")
@@ -3248,74 +3923,557 @@ def register_all_commands(bot: Freakos):
     automod = app_commands.Group(name="automod", description="Auto moderation")
     tree.add_command(automod)
 
-    @automod.command(name="setup", description="Enable automod.")
+    _am_rule_choices = [app_commands.Choice(name=r, value=r) for r in AM_RULES]
+    _am_action_choices = [app_commands.Choice(name=a, value=a) for a in AM_ACTIONS]
+
+    async def _am_load(interaction) -> dict:
+        return await am_load_config(db, interaction.guild.id)
+
+    async def _am_save(interaction, cfg: dict):
+        await am_save_config(db, interaction.guild.id, cfg)
+
+    def _am_status_embed(cfg: dict) -> discord.Embed:
+        master = cfg.get("_master")
+        e = make_embed(
+            title="🛡️ AutoMod Status",
+            description="**Master switch:** " + ("✅ ON" if master else "❌ OFF"))
+        rules = cfg.get("rules", {}) or {}
+        lines = []
+        for name in AM_RULES:
+            r = rules.get(name, {}) or {}
+            state = "🟢" if r.get("enabled") else "⚪"
+            lines.append(f"{state} `{name}` → {r.get('action', 'delete')}")
+        e.add_field(name="Rules → action", value="\n".join(lines), inline=False)
+        wl = cfg.get("whitelist", {}) or {}
+        e.add_field(
+            name="Global whitelist",
+            value=(f"users {len(_am_int_list(wl.get('users')))} · "
+                   f"roles {len(_am_int_list(wl.get('roles')))} · "
+                   f"channels {len(_am_int_list(wl.get('channels')))}"),
+            inline=True)
+        logs = cfg.get("logs", {}) or {}
+        log_txt = ("on" if logs.get("enabled", True) else "off")
+        if logs.get("channel"):
+            log_txt += f" → <#{logs['channel']}>"
+        else:
+            log_txt += " (default)"
+        e.add_field(name="Logging", value=log_txt, inline=True)
+        return e
+
+    @automod.command(name="setup", description="Enable AutoMod and show an overview.")
     async def am_setup(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.set_config(interaction.guild.id, "automod.enabled", "1")
-        await interaction.response.send_message("✅ Automod enabled.", ephemeral=True)
+        cfg = await _am_load(interaction)
+        await interaction.response.send_message(embed=_am_status_embed(cfg),
+                                                ephemeral=True)
 
-    @automod.command(name="enable", description="Enable automod.")
+    @automod.command(name="enable", description="Enable AutoMod (master switch).")
     async def am_enable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.set_config(interaction.guild.id, "automod.enabled", "1")
-        await interaction.response.send_message("✅ Enabled.", ephemeral=True)
+        await interaction.response.send_message("✅ AutoMod enabled.", ephemeral=True)
 
-    @automod.command(name="disable", description="Disable automod.")
+    @automod.command(name="disable", description="Disable AutoMod (master switch).")
     async def am_disable(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.set_config(interaction.guild.id, "automod.enabled", "0")
-        await interaction.response.send_message("✅ Disabled.", ephemeral=True)
+        await interaction.response.send_message("✅ AutoMod disabled.", ephemeral=True)
 
-    async def _set_setting(interaction, key, value):
+    @automod.command(name="status", description="Show the full AutoMod configuration.")
+    async def am_status(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        s = await db.get_json(interaction.guild.id, "automod.settings", default={})
-        s[key] = value
-        await db.set_json(interaction.guild.id, "automod.settings", s)
-        await interaction.response.send_message("✅ Saved.", ephemeral=True)
+        cfg = await _am_load(interaction)
+        await interaction.response.send_message(embed=_am_status_embed(cfg),
+                                                ephemeral=True)
 
-    @automod.command(name="antispam", description="Toggle anti-spam.")
-    async def am_spam(interaction: discord.Interaction, enabled: bool):
-        await _set_setting(interaction, "antispam", enabled)
+    @automod.command(name="reset", description="Reset ALL AutoMod settings to defaults.")
+    async def am_reset(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        await _am_save(interaction, _am_default_config())
+        await db.set_config(interaction.guild.id, "automod.enabled", "0")
+        await interaction.response.send_message(
+            "✅ AutoMod reset to defaults (master switch off).", ephemeral=True)
 
-    @automod.command(name="links", description="Toggle link filtering.")
-    async def am_links(interaction: discord.Interaction, enabled: bool):
-        await _set_setting(interaction, "links", enabled)
+    # --- Per-rule subgroups (enable/disable on every rule) ---
+    _am_groups: dict = {}
+    for _r in AM_RULES:
+        _g = app_commands.Group(name=_r, description=f"{_r.capitalize()} protection")
+        automod.add_command(_g)
+        _am_groups[_r] = _g
 
-    @automod.command(name="mentions", description="Toggle mention-spam filter.")
-    async def am_mentions(interaction: discord.Interaction, enabled: bool):
-        await _set_setting(interaction, "mentions", enabled)
+    def _am_add_toggles(group, rule: str):
+        @group.command(name="enable", description=f"Enable the {rule} rule.")
+        async def _rule_enable(interaction: discord.Interaction):
+            if not await require_admin(interaction): return
+            cfg = await _am_load(interaction)
+            am_rule(cfg, rule)["enabled"] = True
+            await _am_save(interaction, cfg)
+            await interaction.response.send_message(
+                f"✅ `{rule}` enabled.", ephemeral=True)
 
-    @automod.command(name="invites", description="Toggle invite filter.")
-    async def am_invites(interaction: discord.Interaction, enabled: bool):
-        await _set_setting(interaction, "invites", enabled)
+        @group.command(name="disable", description=f"Disable the {rule} rule.")
+        async def _rule_disable(interaction: discord.Interaction):
+            if not await require_admin(interaction): return
+            cfg = await _am_load(interaction)
+            am_rule(cfg, rule)["enabled"] = False
+            await _am_save(interaction, cfg)
+            await interaction.response.send_message(
+                f"✅ `{rule}` disabled.", ephemeral=True)
 
-    @automod.command(name="words", description="Set banned words (comma-separated).")
-    async def am_words(interaction: discord.Interaction, words: str):
-        await _set_setting(interaction, "words",
-                           [w.strip() for w in words.split(",") if w.strip()])
+    for _r in AM_RULES:
+        _am_add_toggles(_am_groups[_r], _r)
 
-    @automod.command(name="actions", description="Set action (delete/warn/timeout/kick/ban).")
-    async def am_actions(interaction: discord.Interaction, action: str):
-        action = action.lower()
-        if action not in ("delete", "warn", "timeout", "kick", "ban"):
+    # --- spam settings ---
+    @_am_groups["spam"].command(name="settings", description="Configure spam detection.")
+    async def am_spam_settings(interaction: discord.Interaction,
+                               max_messages: Optional[int] = None,
+                               window: Optional[int] = None,
+                               duplicate_count: Optional[int] = None,
+                               duplicate_window: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "spam")
+        if max_messages is not None: r["max_messages"] = max(2, int(max_messages))
+        if window is not None: r["window"] = max(1, int(window))
+        if duplicate_count is not None: r["duplicate_count"] = max(2, int(duplicate_count))
+        if duplicate_window is not None: r["duplicate_window"] = max(1, int(duplicate_window))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Spam: {r['max_messages']} msgs/{r['window']}s · "
+            f"duplicate {r['duplicate_count']}/{r['duplicate_window']}s",
+            ephemeral=True)
+
+    # --- links settings ---
+    @_am_groups["links"].command(name="settings", description="Configure link filtering.")
+    @app_commands.choices(mode=[app_commands.Choice(name=m, value=m)
+                                for m in ("all", "blacklist", "whitelist")])
+    async def am_links_settings(interaction: discord.Interaction,
+                                mode: Optional[app_commands.Choice[str]] = None,
+                                blacklist: Optional[str] = None,
+                                allowlist: Optional[str] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "links")
+        if mode is not None: r["mode"] = mode.value
+        if blacklist is not None:
+            r["blacklist"] = [d.strip().lower() for d in blacklist.split(",") if d.strip()]
+        if allowlist is not None:
+            r["allowlist"] = [d.strip().lower() for d in allowlist.split(",") if d.strip()]
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Links mode: **{r.get('mode', 'blacklist')}** · "
+            f"blacklist {len(r.get('blacklist', []))} · allowlist {len(r.get('allowlist', []))}",
+            ephemeral=True)
+
+    # --- words settings + management ---
+    @_am_groups["words"].command(name="settings", description="Configure banned-word matching.")
+    @app_commands.choices(match=[app_commands.Choice(name=m, value=m)
+                                 for m in ("exact", "partial")])
+    async def am_words_settings(interaction: discord.Interaction,
+                                match: Optional[app_commands.Choice[str]] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "words")
+        if match is not None: r["match"] = match.value
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Word match mode: **{r.get('match', 'partial')}**", ephemeral=True)
+
+    @_am_groups["words"].command(name="add", description="Add banned word(s), comma-separated.")
+    async def am_words_add(interaction: discord.Interaction, words: str):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "words")
+        cur = [str(w) for w in (r.get("words") or [])]
+        low = {w.lower() for w in cur}
+        added = []
+        for w in words.split(","):
+            w = w.strip()
+            if w and w.lower() not in low:
+                cur.append(w)
+                low.add(w.lower())
+                added.append(w)
+        r["words"] = cur
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            ("✅ Added: " + ", ".join(f"`{w}`" for w in added)) if added
+            else "ℹ️ No new words added.", ephemeral=True)
+
+    @_am_groups["words"].command(name="remove", description="Remove banned word(s), comma-separated.")
+    async def am_words_remove(interaction: discord.Interaction, words: str):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "words")
+        cur = [str(w) for w in (r.get("words") or [])]
+        drop = {w.strip().lower() for w in words.split(",") if w.strip()}
+        kept = [w for w in cur if w.lower() not in drop]
+        removed = len(cur) - len(kept)
+        r["words"] = kept
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Removed {removed} word(s). {len(kept)} remain.", ephemeral=True)
+
+    @_am_groups["words"].command(name="list", description="List banned words.")
+    async def am_words_list(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        words = [str(w) for w in (am_rule(cfg, "words").get("words") or [])]
+        if not words:
             return await interaction.response.send_message(
-                "Invalid action.", ephemeral=True)
-        await _set_setting(interaction, "action", action)
+                "No banned words configured.", ephemeral=True)
+        shown = ", ".join(f"`{w}`" for w in words[:100])
+        more = f"\n…and {len(words) - 100} more" if len(words) > 100 else ""
+        await interaction.response.send_message(
+            f"**{len(words)} banned word(s):**\n{shown}{more}", ephemeral=True)
 
-    @automod.command(name="whitelist", description="Whitelist a channel or role.")
-    async def am_whitelist(interaction: discord.Interaction,
-                           channel: Optional[discord.TextChannel] = None,
-                           role: Optional[discord.Role] = None):
+    @_am_groups["words"].command(name="clear", description="Clear all banned words.")
+    async def am_words_clear(interaction: discord.Interaction):
         if not await require_admin(interaction): return
-        wl = await db.get_json(interaction.guild.id, "automod.whitelist", default={})
-        wl.setdefault("channels", [])
-        wl.setdefault("roles", [])
-        if channel and channel.id not in wl["channels"]:
-            wl["channels"].append(channel.id)
-        if role and role.id not in wl["roles"]:
-            wl["roles"].append(role.id)
-        await db.set_json(interaction.guild.id, "automod.whitelist", wl)
-        await interaction.response.send_message("✅ Whitelisted.", ephemeral=True)
+        cfg = await _am_load(interaction)
+        am_rule(cfg, "words")["words"] = []
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message("✅ Cleared all banned words.",
+                                                ephemeral=True)
+
+    # --- mentions settings ---
+    @_am_groups["mentions"].command(name="settings", description="Configure mention limits.")
+    async def am_mentions_settings(interaction: discord.Interaction,
+                                   max_mentions: Optional[int] = None,
+                                   max_role_mentions: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "mentions")
+        if max_mentions is not None: r["max_mentions"] = max(1, int(max_mentions))
+        if max_role_mentions is not None: r["max_role_mentions"] = max(1, int(max_role_mentions))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Mentions: max {r['max_mentions']} users / {r['max_role_mentions']} roles",
+            ephemeral=True)
+
+    # --- caps settings ---
+    @_am_groups["caps"].command(name="settings", description="Configure caps filter.")
+    async def am_caps_settings(interaction: discord.Interaction,
+                               percent: Optional[int] = None,
+                               min_length: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "caps")
+        if percent is not None: r["percent"] = max(1, min(100, int(percent)))
+        if min_length is not None: r["min_length"] = max(1, int(min_length))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Caps: {r['percent']}% over {r['min_length']} chars", ephemeral=True)
+
+    # --- emojis settings ---
+    @_am_groups["emojis"].command(name="settings", description="Configure emoji-spam limit.")
+    async def am_emojis_settings(interaction: discord.Interaction,
+                                 max_emojis: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "emojis")
+        if max_emojis is not None: r["max_emojis"] = max(1, int(max_emojis))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Emojis: max {r['max_emojis']}", ephemeral=True)
+
+    # --- characters settings ---
+    @_am_groups["characters"].command(name="settings", description="Configure repeated-character limit.")
+    async def am_characters_settings(interaction: discord.Interaction,
+                                     max_repeat: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "characters")
+        if max_repeat is not None: r["max_repeat"] = max(2, int(max_repeat))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Characters: max {r['max_repeat']} repeats", ephemeral=True)
+
+    # --- raid settings ---
+    @_am_groups["raid"].command(name="settings", description="Configure raid protection.")
+    async def am_raid_settings(interaction: discord.Interaction,
+                               max_joins: Optional[int] = None,
+                               window: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "raid")
+        if max_joins is not None: r["max_joins"] = max(2, int(max_joins))
+        if window is not None: r["window"] = max(1, int(window))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Raid: {r['max_joins']} joins/{r['window']}s", ephemeral=True)
+
+    # --- accounts settings ---
+    @_am_groups["accounts"].command(name="settings", description="Configure account-age protection.")
+    async def am_accounts_settings(interaction: discord.Interaction,
+                                   min_age_days: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "accounts")
+        if min_age_days is not None: r["min_age_days"] = max(0, int(min_age_days))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Accounts: min age {r['min_age_days']} day(s)", ephemeral=True)
+
+    # --- antinuke settings ---
+    @_am_groups["antinuke"].command(name="settings", description="Configure anti-nuke thresholds.")
+    async def am_antinuke_settings(interaction: discord.Interaction,
+                                   max_deletes: Optional[int] = None,
+                                   window: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, "antinuke")
+        if max_deletes is not None: r["max_deletes"] = max(1, int(max_deletes))
+        if window is not None: r["window"] = max(1, int(window))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ Anti-nuke: {r['max_deletes']} actions/{r['window']}s", ephemeral=True)
+
+    # --- action set (per-rule punishment) ---
+    action_grp = app_commands.Group(name="action", description="Per-rule punishments")
+    automod.add_command(action_grp)
+
+    @action_grp.command(name="set", description="Set the punishment for a rule.")
+    @app_commands.choices(rule=_am_rule_choices, action=_am_action_choices)
+    async def am_action_set(interaction: discord.Interaction,
+                            rule: app_commands.Choice[str],
+                            action: app_commands.Choice[str],
+                            timeout_duration: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        r = am_rule(cfg, rule.value)
+        r["action"] = action.value
+        extra = ""
+        if timeout_duration is not None:
+            secs = max(1, min(int(timeout_duration), 28 * 86400))
+            r["timeout_duration"] = secs
+            extra = f" · timeout {fmt_duration(secs)}"
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            f"✅ `{rule.value}` punishment → **{action.value}**{extra}", ephemeral=True)
+
+    # --- whitelist ---
+    wl_grp = app_commands.Group(name="whitelist", description="Bypass AutoMod")
+    automod.add_command(wl_grp)
+
+    async def _am_wl_edit(interaction, kind: str, ident: int, remove: bool):
+        cfg = await _am_load(interaction)
+        wl = cfg.setdefault("whitelist", {})
+        lst = _am_int_list(wl.get(kind))
+        if remove:
+            if ident in lst:
+                lst.remove(ident)
+            msg = "✅ Removed from global whitelist."
+        else:
+            if ident not in lst:
+                lst.append(ident)
+            msg = "✅ Added to global whitelist."
+        wl[kind] = lst
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @wl_grp.command(name="channel_add", description="Whitelist a channel (all rules).")
+    async def am_wl_channel_add(interaction: discord.Interaction,
+                                channel: discord.TextChannel):
+        if not await require_admin(interaction): return
+        await _am_wl_edit(interaction, "channels", channel.id, False)
+
+    @wl_grp.command(name="channel_remove", description="Un-whitelist a channel.")
+    async def am_wl_channel_remove(interaction: discord.Interaction,
+                                   channel: discord.TextChannel):
+        if not await require_admin(interaction): return
+        await _am_wl_edit(interaction, "channels", channel.id, True)
+
+    @wl_grp.command(name="role_add", description="Whitelist a role (all rules).")
+    async def am_wl_role_add(interaction: discord.Interaction, role: discord.Role):
+        if not await require_admin(interaction): return
+        await _am_wl_edit(interaction, "roles", role.id, False)
+
+    @wl_grp.command(name="role_remove", description="Un-whitelist a role.")
+    async def am_wl_role_remove(interaction: discord.Interaction, role: discord.Role):
+        if not await require_admin(interaction): return
+        await _am_wl_edit(interaction, "roles", role.id, True)
+
+    @wl_grp.command(name="user_add", description="Whitelist a user (all rules).")
+    async def am_wl_user_add(interaction: discord.Interaction, user: discord.Member):
+        if not await require_admin(interaction): return
+        await _am_wl_edit(interaction, "users", user.id, False)
+
+    @wl_grp.command(name="user_remove", description="Un-whitelist a user.")
+    async def am_wl_user_remove(interaction: discord.Interaction, user: discord.Member):
+        if not await require_admin(interaction): return
+        await _am_wl_edit(interaction, "users", user.id, True)
+
+    @wl_grp.command(name="rule", description="Whitelist a channel/role/user for ONE rule.")
+    @app_commands.choices(rule=_am_rule_choices)
+    async def am_wl_rule(interaction: discord.Interaction,
+                         rule: app_commands.Choice[str],
+                         channel: Optional[discord.TextChannel] = None,
+                         role: Optional[discord.Role] = None,
+                         user: Optional[discord.Member] = None,
+                         remove: bool = False):
+        if not await require_admin(interaction): return
+        if not (channel or role or user):
+            return await interaction.response.send_message(
+                "Provide a channel, role, or user.", ephemeral=True)
+        cfg = await _am_load(interaction)
+        rwl = cfg.setdefault("rule_whitelist", {}).setdefault(
+            rule.value, {"users": [], "roles": [], "channels": []})
+        changed = 0
+        for kind, obj in (("channels", channel), ("roles", role), ("users", user)):
+            if obj is None:
+                continue
+            lst = _am_int_list(rwl.get(kind))
+            if remove:
+                if obj.id in lst:
+                    lst.remove(obj.id)
+                    changed += 1
+            elif obj.id not in lst:
+                lst.append(obj.id)
+                changed += 1
+            rwl[kind] = lst
+        await _am_save(interaction, cfg)
+        verb = "Removed" if remove else "Added"
+        await interaction.response.send_message(
+            f"✅ {verb} {changed} entr(ies) for rule `{rule.value}`.", ephemeral=True)
+
+    # --- messages ---
+    msg_grp = app_commands.Group(name="messages", description="Violation messages")
+    automod.add_command(msg_grp)
+
+    @msg_grp.command(name="set", description="Set the public violation message template.")
+    async def am_msg_set(interaction: discord.Interaction, template: str,
+                         delete_after: Optional[int] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        msgs = cfg.setdefault("messages", {})
+        msgs["violation"] = template[:1900]
+        if delete_after is not None:
+            msgs["delete_after"] = max(0, int(delete_after))
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            "✅ Violation message saved.\n"
+            "Placeholders: `{user}` `{mention}` `{username}` `{display_name}` "
+            "`{server}` `{rule}` `{action}` `{reason}`", ephemeral=True)
+
+    @msg_grp.command(name="reset", description="Reset the violation message to default.")
+    async def am_msg_reset(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        msgs = cfg.setdefault("messages", {})
+        msgs["violation"] = AM_DEFAULT_MESSAGE
+        msgs["delete_after"] = 8
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message("✅ Violation message reset.",
+                                                ephemeral=True)
+
+    @msg_grp.command(name="view", description="View the current violation message.")
+    async def am_msg_view(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        msgs = cfg.get("messages", {}) or {}
+        await interaction.response.send_message(
+            f"**Template:**\n```\n{msgs.get('violation', AM_DEFAULT_MESSAGE)}\n```\n"
+            f"**Delete after:** {msgs.get('delete_after', 8)}s", ephemeral=True)
+
+    # --- logs ---
+    logs_grp = app_commands.Group(name="logs", description="AutoMod logging")
+    automod.add_command(logs_grp)
+
+    @logs_grp.command(name="enable", description="Enable AutoMod logging.")
+    async def am_logs_enable(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        cfg.setdefault("logs", {})["enabled"] = True
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message("✅ AutoMod logging enabled.",
+                                                ephemeral=True)
+
+    @logs_grp.command(name="disable", description="Disable AutoMod logging.")
+    async def am_logs_disable(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        cfg.setdefault("logs", {})["enabled"] = False
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message("✅ AutoMod logging disabled.",
+                                                ephemeral=True)
+
+    @logs_grp.command(name="channel", description="Set a dedicated AutoMod log channel.")
+    async def am_logs_channel(interaction: discord.Interaction,
+                              channel: Optional[discord.TextChannel] = None):
+        if not await require_admin(interaction): return
+        cfg = await _am_load(interaction)
+        cfg.setdefault("logs", {})["channel"] = channel.id if channel else None
+        await _am_save(interaction, cfg)
+        await interaction.response.send_message(
+            ("✅ AutoMod logs → " + channel.mention) if channel
+            else "✅ AutoMod logs fall back to the default logging channel.",
+            ephemeral=True)
+
+    # --- stats ---
+    stats_grp = app_commands.Group(name="stats", description="Violation statistics")
+    automod.add_command(stats_grp)
+
+    @stats_grp.command(name="stats", description="Overall AutoMod statistics.")
+    async def am_stats_stats(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        gid = interaction.guild.id
+        total = await db.fetchone(
+            "SELECT COUNT(*) AS c FROM automod_violations WHERE guild_id=?", (gid,))
+        per_rule = await db.fetchall(
+            "SELECT rule, COUNT(*) AS c FROM automod_violations "
+            "WHERE guild_id=? GROUP BY rule ORDER BY c DESC", (gid,))
+        e = make_embed(title="📊 AutoMod Statistics",
+                       description=f"**Total violations:** {total['c'] if total else 0}")
+        if per_rule:
+            e.add_field(name="By rule",
+                        value="\n".join(f"`{r['rule']}` — {r['c']}" for r in per_rule),
+                        inline=False)
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @stats_grp.command(name="violations", description="Recent violations (optionally for a user).")
+    async def am_stats_violations(interaction: discord.Interaction,
+                                  user: Optional[discord.Member] = None):
+        if not await require_admin(interaction): return
+        gid = interaction.guild.id
+        if user is not None:
+            rows = await db.fetchall(
+                "SELECT rule, action, reason, created_at FROM automod_violations "
+                "WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 10",
+                (gid, user.id))
+            title = f"📄 Violations — {user}"
+        else:
+            rows = await db.fetchall(
+                "SELECT user_id, rule, action, reason, created_at FROM automod_violations "
+                "WHERE guild_id=? ORDER BY id DESC LIMIT 10", (gid,))
+            title = "📄 Recent Violations"
+        if not rows:
+            return await interaction.response.send_message(
+                "No violations recorded.", ephemeral=True)
+        lines = []
+        for r in rows:
+            who = "" if user is not None else f"<@{r['user_id']}> "
+            lines.append(f"{who}`{r['rule']}` → {r['action']} — {r['created_at']}")
+        await interaction.response.send_message(
+            embed=make_embed(title=title, description="\n".join(lines)[:4000]),
+            ephemeral=True)
+
+    @stats_grp.command(name="top", description="Top rule violators.")
+    async def am_stats_top(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        gid = interaction.guild.id
+        rows = await db.fetchall(
+            "SELECT user_id, COUNT(*) AS c FROM automod_violations "
+            "WHERE guild_id=? GROUP BY user_id ORDER BY c DESC LIMIT 10", (gid,))
+        if not rows:
+            return await interaction.response.send_message(
+                "No violations recorded.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=make_embed(
+                title="🏆 Top Violators",
+                description="\n".join(f"<@{r['user_id']}> — {r['c']}" for r in rows)),
+            ephemeral=True)
+
 
     # ---------------- MODERATION ----------------
     async def _create_case(guild_id: int, user_id: int, mod_id: int,
