@@ -1392,9 +1392,9 @@ class Freakos(commands.Bot):
         register_all_commands(self)
         await self._restore_persistent_views()
 
-        # Force-sync commands to Discord (fixes CommandSignatureMismatch).
+        # Force-sync commands to Discord (fixes CommandSignatureMismatch and
+        # ensures edited commands like /vcnotify setup & add are pushed live).
         try:
-            self.tree.copy_global_to(guild=None)
             synced = await self.tree.sync()
             log.info("Synced %d slash commands (global)", len(synced))
         except Exception:
@@ -1929,6 +1929,22 @@ def register_all_commands(bot: Freakos):
                 "You need Manage Server / Administrator.", ephemeral=True)
             return False
         return True
+
+    @tree.error
+    async def _on_command_error(interaction: discord.Interaction,
+                                error: app_commands.AppCommandError):
+        # Catches errors raised BEFORE a command acknowledges the interaction
+        # (e.g. a channel option that fails to resolve). Without this, Discord
+        # shows the generic "The application did not respond".
+        log.exception("Slash command error", exc_info=error)
+        msg = f"❌ Something went wrong: {error}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            log.exception("Failed to report command error to user")
 
     # ---------------- GENERAL ----------------
     @tree.command(name="ping", description="Show bot latency.")
@@ -2504,6 +2520,16 @@ def register_all_commands(bot: Freakos):
     async def _vc_set_watched(guild_id: int, watched: list):
         await db.set_json(guild_id, "vcnotify.channels", watched)
 
+    async def _vc_reply_error(interaction: discord.Interaction, msg: str):
+        """Send an error reply whether or not the interaction was already deferred."""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            log.exception("Failed to send vcnotify error reply")
+
     @vcnotify.command(name="setup",
                       description="Bind a voice channel to a text channel and enable notifications.")
     @app_commands.describe(voice_channel="Voice channel to watch",
@@ -2511,10 +2537,16 @@ def register_all_commands(bot: Freakos):
     async def v_setup(interaction: discord.Interaction,
                       voice_channel: discord.VoiceChannel,
                       text_channel: discord.TextChannel):
-        if not await require_admin(interaction):
-            return
+        # Defer FIRST so Discord always gets an acknowledgement within 3s.
+        # This is what fixes "The application did not respond".
         await interaction.response.defer(ephemeral=True)
         try:
+            if not interaction.guild:
+                return await interaction.followup.send("Guild only.", ephemeral=True)
+            if not is_admin_or_mod(interaction.user):
+                return await interaction.followup.send(
+                    "You need Manage Server / Administrator.", ephemeral=True)
+
             cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
             cfg["target_channel_id"] = text_channel.id
             cfg["enabled"] = True
@@ -2524,7 +2556,7 @@ def register_all_commands(bot: Freakos):
             watched = [int(c) for c in watched if str(c).isdigit()]
             if voice_channel.id not in watched:
                 watched.append(voice_channel.id)
-                await _vc_set_watched(interaction.guild.id, watched)
+            await _vc_set_watched(interaction.guild.id, watched)
 
             await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
             await interaction.followup.send(
@@ -2533,7 +2565,7 @@ def register_all_commands(bot: Freakos):
                 ephemeral=True)
         except Exception as e:
             log.exception("vcnotify setup failed")
-            await interaction.followup.send(f"❌ Setup failed: {e}", ephemeral=True)
+            await _vc_reply_error(interaction, f"❌ Setup failed: {e}")
 
     @vcnotify.command(name="add", description="Watch a voice channel.")
     @app_commands.describe(voice_channel="Voice channel to watch",
@@ -2541,10 +2573,15 @@ def register_all_commands(bot: Freakos):
     async def v_add(interaction: discord.Interaction,
                     voice_channel: discord.VoiceChannel,
                     text_channel: discord.TextChannel):
-        if not await require_admin(interaction):
-            return
+        # Defer FIRST so Discord always gets an acknowledgement within 3s.
         await interaction.response.defer(ephemeral=True)
         try:
+            if not interaction.guild:
+                return await interaction.followup.send("Guild only.", ephemeral=True)
+            if not is_admin_or_mod(interaction.user):
+                return await interaction.followup.send(
+                    "You need Manage Server / Administrator.", ephemeral=True)
+
             cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
             cfg["target_channel_id"] = text_channel.id
             cfg.setdefault("enabled", True)
@@ -2554,7 +2591,7 @@ def register_all_commands(bot: Freakos):
             watched = [int(c) for c in watched if str(c).isdigit()]
             if voice_channel.id not in watched:
                 watched.append(voice_channel.id)
-                await _vc_set_watched(interaction.guild.id, watched)
+            await _vc_set_watched(interaction.guild.id, watched)
 
             await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
             await interaction.followup.send(
@@ -2562,7 +2599,7 @@ def register_all_commands(bot: Freakos):
                 ephemeral=True)
         except Exception as e:
             log.exception("vcnotify add failed")
-            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
+            await _vc_reply_error(interaction, f"❌ Failed: {e}")
 
     @vcnotify.command(name="remove", description="Stop watching a voice channel.")
     @app_commands.describe(voice_channel="Voice channel to stop watching")
