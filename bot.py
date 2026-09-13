@@ -1975,16 +1975,33 @@ class Freakos(commands.Bot):
                     log.exception("Autorole failed")
 
         if await self.db.get_config(guild.id, "autonick.enabled", "0") == "1":
-            fmt = await self.db.get_config(guild.id, "autonick.format") or "{user}"
+            fmt = await self.db.get_config(guild.id, "autonick.format") or "{name}"
+
+            # Fully customizable placeholders:
+            # {name} / {display_name} -> Discord display name
+            # {username} / {user}      -> Discord username
+            # {mention}                -> member mention
+            # {id}                     -> member ID
+            # {server}                 -> server name
+            # {member_count} / {count} -> current member count
             nick = apply_placeholders(
-                fmt, user=member.name, username=member.name,
-                display_name=member.display_name, server=guild.name)[:32]
+                fmt,
+                name=member.display_name,
+                display_name=member.display_name,
+                username=member.name,
+                user=member.name,
+                mention=member.mention,
+                id=member.id,
+                server=guild.name,
+                member_count=str(guild.member_count),
+                count=str(guild.member_count),
+            ).strip()[:32]
+
             try:
-                if guild.me.guild_permissions.manage_nicknames and \
-                        member.top_role < guild.me.top_role:
-                    await member.edit(nick=nick, reason="Autonick")
+                if nick and guild.me.guild_permissions.manage_nicknames and                         member.top_role < guild.me.top_role:
+                    await member.edit(nick=nick, reason="Autonickname")
             except Exception:
-                pass
+                log.exception("Autonickname failed for %s", member.id)
 
         await _log_guild(self, guild, "joins", "Member Joined",
                          f"{member.mention} ({member})")
@@ -2684,7 +2701,7 @@ def register_all_commands(bot: Freakos):
             "General": ["ping", "help", "serverinfo", "userinfo", "avatar", "setup", "sync"],
             "Welcome": ["welcome"],
             "Autorole": ["autorole"],
-            "Autonick": ["autonick"],
+            "Autonick": ["autonick", "autonickname"],
             "Departure": ["departure"],
             "Action DMs": ["actiondm"],
             "VC Notifications": ["vcnotify"],
@@ -3014,6 +3031,48 @@ def register_all_commands(bot: Freakos):
         for k in ("autonick.format", "autonick.enabled"):
             await db.set_config(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
+
+    # Full /autonickname alias. Uses the same stored settings as /autonick.
+    autonickname = app_commands.Group(
+        name="autonickname",
+        description="Fully customizable automatic nicknames"
+    )
+    tree.add_command(autonickname)
+
+    @autonickname.command(name="setup", description="Set a custom nickname format and enable it.")
+    async def an_full_setup(interaction: discord.Interaction, format: str):
+        if not await require_admin(interaction): return
+        await db.set_config(interaction.guild.id, "autonick.format", format)
+        await db.set_config(interaction.guild.id, "autonick.enabled", "1")
+        await interaction.response.send_message(
+            "✅ Autonickname enabled with your custom format.", ephemeral=True)
+
+    @autonickname.command(name="format", description="Change the custom nickname format.")
+    async def an_full_format(interaction: discord.Interaction, format: str):
+        if not await require_admin(interaction): return
+        await db.set_config(interaction.guild.id, "autonick.format", format)
+        await interaction.response.send_message(
+            "✅ Autonickname format updated.", ephemeral=True)
+
+    @autonickname.command(name="enable", description="Enable autonickname.")
+    async def an_full_enable(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        await db.set_config(interaction.guild.id, "autonick.enabled", "1")
+        await interaction.response.send_message("✅ Autonickname enabled.", ephemeral=True)
+
+    @autonickname.command(name="disable", description="Disable autonickname.")
+    async def an_full_disable(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        await db.set_config(interaction.guild.id, "autonick.enabled", "0")
+        await interaction.response.send_message("✅ Autonickname disabled.", ephemeral=True)
+
+    @autonickname.command(name="reset", description="Reset autonickname settings.")
+    async def an_full_reset(interaction: discord.Interaction):
+        if not await require_admin(interaction): return
+        for k in ("autonick.format", "autonick.enabled"):
+            await db.set_config(interaction.guild.id, k, None)
+        await interaction.response.send_message("✅ Autonickname reset.", ephemeral=True)
+
 
     # ---------------- DEPARTURE ----------------
     departure = app_commands.Group(name="departure", description="Departure messages")
