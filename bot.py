@@ -1902,11 +1902,16 @@ class Freakos(commands.Bot):
                     "𑣲 Welcome:\n{mention}\n\n"
                     "𑣲 Member Count:\n{member_count}\n\n"
                     "𑣲 Joined At:\n{joined_at}")
+                now_local = datetime.now().astimezone()
                 ph = dict(
                     user=member.name, mention=member.mention,
                     username=member.name, display_name=member.display_name,
-                    server=guild.name, member_count=str(guild.member_count),
-                    joined_at=fmt_dt_human(member.joined_at or now_utc()))
+                    name=member.display_name, server=guild.name,
+                    member_count=str(guild.member_count),
+                    joined_at=fmt_dt_human(member.joined_at or now_utc()),
+                    created_at=member.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
+                    time=now_local.strftime("Today at %H:%M"),
+                    avatar=member.display_avatar.url)
                 rendered = apply_placeholders(msg_tpl, **ph)
                 embed_cfg = await self.db.get_json(
                     guild.id, "welcome.embed", default={}) or {}
@@ -1949,7 +1954,11 @@ class Freakos(commands.Bot):
                 dm_ph = dict(
                     user=member.name, mention=member.mention,
                     username=member.name, display_name=member.display_name,
-                    server=guild.name, member_count=str(guild.member_count))
+                    name=member.display_name, server=guild.name,
+                    member_count=str(guild.member_count),
+                    created_at=member.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
+                    time=datetime.now().astimezone().strftime("Today at %H:%M"),
+                    avatar=member.display_avatar.url)
                 try:
                     dm_embed = discord.Embed(
                         color=0x5865F2, timestamp=now_utc(),
@@ -1975,33 +1984,16 @@ class Freakos(commands.Bot):
                     log.exception("Autorole failed")
 
         if await self.db.get_config(guild.id, "autonick.enabled", "0") == "1":
-            fmt = await self.db.get_config(guild.id, "autonick.format") or "{name}"
-
-            # Fully customizable placeholders:
-            # {name} / {display_name} -> Discord display name
-            # {username} / {user}      -> Discord username
-            # {mention}                -> member mention
-            # {id}                     -> member ID
-            # {server}                 -> server name
-            # {member_count} / {count} -> current member count
+            fmt = await self.db.get_config(guild.id, "autonick.format") or "{user}"
             nick = apply_placeholders(
-                fmt,
-                name=member.display_name,
-                display_name=member.display_name,
-                username=member.name,
-                user=member.name,
-                mention=member.mention,
-                id=member.id,
-                server=guild.name,
-                member_count=str(guild.member_count),
-                count=str(guild.member_count),
-            ).strip()[:32]
-
+                fmt, user=member.name, username=member.name,
+                display_name=member.display_name, server=guild.name)[:32]
             try:
-                if nick and guild.me.guild_permissions.manage_nicknames and                         member.top_role < guild.me.top_role:
-                    await member.edit(nick=nick, reason="Autonickname")
+                if guild.me.guild_permissions.manage_nicknames and \
+                        member.top_role < guild.me.top_role:
+                    await member.edit(nick=nick, reason="Autonick")
             except Exception:
-                log.exception("Autonickname failed for %s", member.id)
+                pass
 
         await _log_guild(self, guild, "joins", "Member Joined",
                          f"{member.mention} ({member})")
@@ -2701,7 +2693,7 @@ def register_all_commands(bot: Freakos):
             "General": ["ping", "help", "serverinfo", "userinfo", "avatar", "setup", "sync"],
             "Welcome": ["welcome"],
             "Autorole": ["autorole"],
-            "Autonick": ["autonick", "autonickname"],
+            "Autonick": ["autonick"],
             "Departure": ["departure"],
             "Action DMs": ["actiondm"],
             "VC Notifications": ["vcnotify"],
@@ -2841,13 +2833,18 @@ def register_all_commands(bot: Freakos):
                 "No welcome channel set.", ephemeral=True)
         tpl = await db.get_config(interaction.guild.id, "welcome.message") or \
             "Welcome {mention}!"
+        now_local = datetime.now().astimezone()
         ph = dict(
             user=interaction.user.name, mention=interaction.user.mention,
             username=interaction.user.name,
             display_name=interaction.user.display_name,
+            name=interaction.user.display_name,
             server=interaction.guild.name,
             member_count=str(interaction.guild.member_count),
-            joined_at=fmt_dt_human(interaction.user.joined_at or now_utc()))
+            joined_at=fmt_dt_human(interaction.user.joined_at or now_utc()),
+            created_at=interaction.user.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
+            time=now_local.strftime("Today at %H:%M"),
+            avatar=interaction.user.display_avatar.url)
         rendered = apply_placeholders(tpl, **ph)
         embed_cfg = await db.get_json(
             interaction.guild.id, "welcome.embed", default={}) or {}
@@ -3031,48 +3028,6 @@ def register_all_commands(bot: Freakos):
         for k in ("autonick.format", "autonick.enabled"):
             await db.set_config(interaction.guild.id, k, None)
         await interaction.response.send_message("✅ Reset.", ephemeral=True)
-
-    # Full /autonickname alias. Uses the same stored settings as /autonick.
-    autonickname = app_commands.Group(
-        name="autonickname",
-        description="Fully customizable automatic nicknames"
-    )
-    tree.add_command(autonickname)
-
-    @autonickname.command(name="setup", description="Set a custom nickname format and enable it.")
-    async def an_full_setup(interaction: discord.Interaction, format: str):
-        if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autonick.format", format)
-        await db.set_config(interaction.guild.id, "autonick.enabled", "1")
-        await interaction.response.send_message(
-            "✅ Autonickname enabled with your custom format.", ephemeral=True)
-
-    @autonickname.command(name="format", description="Change the custom nickname format.")
-    async def an_full_format(interaction: discord.Interaction, format: str):
-        if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autonick.format", format)
-        await interaction.response.send_message(
-            "✅ Autonickname format updated.", ephemeral=True)
-
-    @autonickname.command(name="enable", description="Enable autonickname.")
-    async def an_full_enable(interaction: discord.Interaction):
-        if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autonick.enabled", "1")
-        await interaction.response.send_message("✅ Autonickname enabled.", ephemeral=True)
-
-    @autonickname.command(name="disable", description="Disable autonickname.")
-    async def an_full_disable(interaction: discord.Interaction):
-        if not await require_admin(interaction): return
-        await db.set_config(interaction.guild.id, "autonick.enabled", "0")
-        await interaction.response.send_message("✅ Autonickname disabled.", ephemeral=True)
-
-    @autonickname.command(name="reset", description="Reset autonickname settings.")
-    async def an_full_reset(interaction: discord.Interaction):
-        if not await require_admin(interaction): return
-        for k in ("autonick.format", "autonick.enabled"):
-            await db.set_config(interaction.guild.id, k, None)
-        await interaction.response.send_message("✅ Autonickname reset.", ephemeral=True)
-
 
     # ---------------- DEPARTURE ----------------
     departure = app_commands.Group(name="departure", description="Departure messages")
