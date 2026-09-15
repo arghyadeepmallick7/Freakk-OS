@@ -436,6 +436,34 @@ class Scheduler:
 # Ticket
 # =====================================================================
 
+def _safe_ticket_emoji(guild: discord.Guild, raw: object):
+    """Return an emoji Discord can actually accept in a SelectOption.
+
+    Stored ticket emojis may be Unicode or old/deleted custom emoji strings.
+    A stale custom emoji ID causes Discord error 50035 (Invalid emoji), which
+    prevents the Open Ticket interaction from responding at all.
+    """
+    value = str(raw or '').strip()
+    if not value:
+        return None
+
+    # Custom emoji format: <:name:id> or <a:name:id>. Only use it when the
+    # emoji still exists in this guild. Otherwise omit the emoji safely.
+    m = re.fullmatch(r"<a?:([A-Za-z0-9_]+):(\d+)>", value)
+    if m:
+        try:
+            emoji = guild.get_emoji(int(m.group(2)))
+            return emoji if emoji is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # Unicode emoji are safe as plain strings. Reject obvious Discord custom
+    # emoji/ID leftovers that are not valid Unicode emoji input.
+    if value.startswith('<') or value.isdigit():
+        return None
+    return value[:100]
+
+
 class TicketCreateButton(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -454,9 +482,12 @@ class TicketCreateButton(discord.ui.View):
                 "No ticket types configured. Ask an admin to run `/ticket type`.",
                 ephemeral=True)
             return
-        opts = [discord.SelectOption(
-            label=r["name"][:100], emoji=(r["emoji"] or None),
-            value=r["name"][:100]) for r in rows[:25]]
+        opts = []
+        for r in rows[:25]:
+            opts.append(discord.SelectOption(
+                label=str(r["name"] or "Ticket")[:100],
+                emoji=_safe_ticket_emoji(guild, r["emoji"]),
+                value=str(r["name"] or "Ticket")[:100]))
         select = discord.ui.Select(placeholder="Pick a ticket type…", options=opts)
 
         async def cb(sel_interaction: discord.Interaction):
@@ -1902,16 +1933,14 @@ class Freakos(commands.Bot):
                     "𑣲 Welcome:\n{mention}\n\n"
                     "𑣲 Member Count:\n{member_count}\n\n"
                     "𑣲 Joined At:\n{joined_at}")
-                now_local = datetime.now().astimezone()
                 ph = dict(
+                    name=member.display_name,
                     user=member.name, mention=member.mention,
                     username=member.name, display_name=member.display_name,
-                    name=member.display_name, server=guild.name,
-                    member_count=str(guild.member_count),
+                    server=guild.name, member_count=str(guild.member_count),
                     joined_at=fmt_dt_human(member.joined_at or now_utc()),
                     created_at=member.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
-                    time=now_local.strftime("Today at %H:%M"),
-                    avatar=member.display_avatar.url)
+                    time=now_utc().strftime("%H:%M"))
                 rendered = apply_placeholders(msg_tpl, **ph)
                 embed_cfg = await self.db.get_json(
                     guild.id, "welcome.embed", default={}) or {}
@@ -1954,11 +1983,7 @@ class Freakos(commands.Bot):
                 dm_ph = dict(
                     user=member.name, mention=member.mention,
                     username=member.name, display_name=member.display_name,
-                    name=member.display_name, server=guild.name,
-                    member_count=str(guild.member_count),
-                    created_at=member.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
-                    time=datetime.now().astimezone().strftime("Today at %H:%M"),
-                    avatar=member.display_avatar.url)
+                    server=guild.name, member_count=str(guild.member_count))
                 try:
                     dm_embed = discord.Embed(
                         color=0x5865F2, timestamp=now_utc(),
@@ -2405,7 +2430,7 @@ class Freakos(commands.Bot):
     async def _automod_leave_check(self, member: discord.Member):
         """Detect kicks via audit log for anti-nuke."""
         await self._am_nuke_check(
-            member.guild, discord.AuditLogAction.member_kick, "Kick",
+            member.guild, discord.AuditLogAction.kick, "Kick",
             f"kicked {member.mention} ({member})")
 
     async def _am_nuke_check(self, guild: discord.Guild, audit_action,
@@ -2815,7 +2840,7 @@ def register_all_commands(bot: Freakos):
             f"✅ Server logo: **{'on' if enabled else 'off'}**.", ephemeral=True)
 
     @welcome.command(name="message",
-                     description="Set the welcome embed description (supports newlines).")
+                     description="Set the welcome embed description (supports placeholders and newlines).")
     async def w_message(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         current = await db.get_config(interaction.guild.id, "welcome.message", "") or ""
@@ -2833,18 +2858,16 @@ def register_all_commands(bot: Freakos):
                 "No welcome channel set.", ephemeral=True)
         tpl = await db.get_config(interaction.guild.id, "welcome.message") or \
             "Welcome {mention}!"
-        now_local = datetime.now().astimezone()
         ph = dict(
+            name=interaction.user.display_name,
             user=interaction.user.name, mention=interaction.user.mention,
             username=interaction.user.name,
             display_name=interaction.user.display_name,
-            name=interaction.user.display_name,
             server=interaction.guild.name,
             member_count=str(interaction.guild.member_count),
             joined_at=fmt_dt_human(interaction.user.joined_at or now_utc()),
             created_at=interaction.user.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
-            time=now_local.strftime("Today at %H:%M"),
-            avatar=interaction.user.display_avatar.url)
+            time=now_utc().strftime("%H:%M"))
         rendered = apply_placeholders(tpl, **ph)
         embed_cfg = await db.get_json(
             interaction.guild.id, "welcome.embed", default={}) or {}
