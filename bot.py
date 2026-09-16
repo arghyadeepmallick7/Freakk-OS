@@ -214,11 +214,6 @@ CREATE TABLE IF NOT EXISTS ticket_types (
     name TEXT NOT NULL, emoji TEXT, category_id INTEGER,
     support_role_id INTEGER, message TEXT, UNIQUE(guild_id, name)
 );
-CREATE TABLE IF NOT EXISTS ticket_panels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
-    channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
-    ticket_type_id INTEGER NOT NULL, UNIQUE(message_id)
-);
 CREATE TABLE IF NOT EXISTS vouches (
     id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL, voucher_id INTEGER NOT NULL,
@@ -441,34 +436,6 @@ class Scheduler:
 # Ticket
 # =====================================================================
 
-def _safe_ticket_emoji(guild: discord.Guild, raw: object):
-    """Return an emoji Discord can actually accept in a SelectOption.
-
-    Stored ticket emojis may be Unicode or old/deleted custom emoji strings.
-    A stale custom emoji ID causes Discord error 50035 (Invalid emoji), which
-    prevents the Open Ticket interaction from responding at all.
-    """
-    value = str(raw or '').strip()
-    if not value:
-        return None
-
-    # Custom emoji format: <:name:id> or <a:name:id>. Only use it when the
-    # emoji still exists in this guild. Otherwise omit the emoji safely.
-    m = re.fullmatch(r"<a?:([A-Za-z0-9_]+):(\d+)>", value)
-    if m:
-        try:
-            emoji = guild.get_emoji(int(m.group(2)))
-            return emoji if emoji is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    # Unicode emoji are safe as plain strings. Reject obvious Discord custom
-    # emoji/ID leftovers that are not valid Unicode emoji input.
-    if value.startswith('<') or value.isdigit():
-        return None
-    return value[:100]
-
-
 class TicketCreateButton(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -487,12 +454,9 @@ class TicketCreateButton(discord.ui.View):
                 "No ticket types configured. Ask an admin to run `/ticket type`.",
                 ephemeral=True)
             return
-        opts = []
-        for r in rows[:25]:
-            opts.append(discord.SelectOption(
-                label=str(r["name"] or "Ticket")[:100],
-                emoji=_safe_ticket_emoji(guild, r["emoji"]),
-                value=str(r["name"] or "Ticket")[:100]))
+        opts = [discord.SelectOption(
+            label=r["name"][:100], emoji=(r["emoji"] or None),
+            value=r["name"][:100]) for r in rows[:25]]
         select = discord.ui.Select(placeholder="Pick a ticket type…", options=opts)
 
         async def cb(sel_interaction: discord.Interaction):
@@ -503,105 +467,6 @@ class TicketCreateButton(discord.ui.View):
         view.add_item(select)
         await interaction.response.send_message(
             "Choose a ticket type to open:", view=view, ephemeral=True)
-
-
-class TeamApplyPanelView(discord.ui.View):
-    """Persistent single-type ticket panel. No global ticket list is exposed."""
-
-    def __init__(self, ticket_type_id: int, label: str, emoji: object = None):
-        super().__init__(timeout=None)
-        self.ticket_type_id = ticket_type_id
-        button = discord.ui.Button(
-            label=(label or "Ticket")[:80],
-            emoji=emoji or None,
-            style=discord.ButtonStyle.primary,
-            custom_id=f"freakos:ticket:single:{ticket_type_id}",
-        )
-        button.callback = self._open
-        self.add_item(button)
-
-    async def _open(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            return
-        row = await interaction.client.db.fetchone(
-            "SELECT * FROM ticket_types WHERE guild_id=? AND id=?",
-            (interaction.guild.id, self.ticket_type_id),
-        )
-        if not row:
-            return await _safe_reply(
-                interaction,
-                "❌ This ticket type is no longer configured. An administrator must update this panel.",
-            )
-        await _open_ticket(interaction, row["name"])
-
-
-class TeamApplyPanelModal(discord.ui.Modal, title="Ticket Panel"):
-    panel_title = discord.ui.TextInput(
-        label="Panel title", style=discord.TextStyle.short,
-        max_length=256, required=True,
-        placeholder="Enter the title for this panel")
-    panel_description = discord.ui.TextInput(
-        label="Panel description", style=discord.TextStyle.paragraph,
-        max_length=4000, required=True,
-        placeholder="Enter the description for this panel")
-    banner_url = discord.ui.TextInput(
-        label="Banner image URL", style=discord.TextStyle.short,
-        max_length=1000, required=True,
-        placeholder="https://...")
-
-    def __init__(self, channel: discord.TextChannel, ticket_type_id: int):
-        super().__init__()
-        self.channel = channel
-        self.ticket_type_id = ticket_type_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            return
-
-        row = await interaction.client.db.fetchone(
-            "SELECT * FROM ticket_types WHERE guild_id=? AND id=?",
-            (interaction.guild.id, self.ticket_type_id),
-        )
-        if not row:
-            return await interaction.response.send_message(
-                "❌ Ticket type not found.", ephemeral=True
-            )
-
-        emoji = _safe_ticket_emoji(interaction.guild, row["emoji"])
-        embed = make_embed(
-            title=self.panel_title.value,
-            description=self.panel_description.value,
-        )
-        try:
-            embed.set_image(url=self.banner_url.value.strip())
-        except Exception:
-            return await interaction.response.send_message(
-                "❌ Invalid banner URL.", ephemeral=True
-            )
-
-        view = TeamApplyPanelView(row["id"], row["name"], emoji)
-        try:
-            message = await self.channel.send(embed=embed, view=view)
-            await interaction.client.db.execute(
-                "INSERT INTO ticket_panels "
-                "(guild_id, channel_id, message_id, ticket_type_id) VALUES (?, ?, ?, ?)",
-                (interaction.guild.id, self.channel.id, message.id, row["id"]),
-            )
-            interaction.client.add_view(view, message_id=message.id)
-        except discord.Forbidden:
-            return await interaction.response.send_message(
-                "❌ I cannot post in that channel. Check my permissions.", ephemeral=True
-            )
-        except Exception:
-            log.exception("Failed to post dedicated ticket panel")
-            return await interaction.response.send_message(
-                "❌ Failed to post the ticket panel.", ephemeral=True
-            )
-
-        await interaction.response.send_message(
-            f"✅ Panel posted in {self.channel.mention} for `{row['name']}`.",
-            ephemeral=True,
-        )
 
 
 class TicketPanelModal(discord.ui.Modal, title="Ticket Panel"):
@@ -747,29 +612,11 @@ async def _generate_transcript(channel) -> discord.File:
 
 async def _post_ticket_close_log(bot: "Freakos", guild: discord.Guild, channel,
                                  row, closed_by, reason: str):
-    """Post the configured close log and/or transcript destinations.
-
-    Nothing is selected automatically: each guild can configure either or both
-    destinations. If both are configured, the close log is sent to the logs
-    channel and the transcript is also sent to the transcript channel.
-    """
-    logs_raw = await bot.db.get_config(guild.id, "ticket.logs_channel")
-    transcript_raw = await bot.db.get_config(guild.id, "ticket.transcript_channel")
-
-    log_ch = None
-    transcript_ch = None
-    try:
-        if logs_raw:
-            log_ch = guild.get_channel(int(logs_raw))
-    except (TypeError, ValueError):
-        log_ch = None
-    try:
-        if transcript_raw:
-            transcript_ch = guild.get_channel(int(transcript_raw))
-    except (TypeError, ValueError):
-        transcript_ch = None
-
-    if not log_ch and not transcript_ch:
+    ch_id = await bot.db.get_config(guild.id, "ticket.logs_channel")
+    if not ch_id:
+        return
+    log_ch = guild.get_channel(int(ch_id))
+    if not log_ch:
         return
 
     t_num = row["ticket_number"]
@@ -794,25 +641,10 @@ async def _post_ticket_close_log(bot: "Freakos", guild: discord.Guild, channel,
     except Exception:
         pass
 
-    transcript = None
-    if log_ch or transcript_ch:
-        transcript = await _generate_transcript(channel)
-
-    if log_ch:
-        try:
-            await log_ch.send(embed=e, file=transcript)
-        except Exception:
-            log.exception("Failed to post ticket close log for ticket %s", row["id"])
-
-    if transcript_ch and (not log_ch or transcript_ch.id != log_ch.id):
-        try:
-            transcript = await _generate_transcript(channel)
-            await transcript_ch.send(
-                content=f"📄 Transcript for ticket {ticket_num_str} ({channel.mention})",
-                file=transcript,
-            )
-        except Exception:
-            log.exception("Failed to post ticket transcript for ticket %s", row["id"])
+    try:
+        await log_ch.send(embed=e, file=await _generate_transcript(channel))
+    except Exception:
+        log.exception("Failed to post ticket close log for ticket %s", row["id"])
 
 
 async def _ticket_delete_delay(db: "Database", guild_id: int) -> int:
@@ -2010,24 +1842,6 @@ class Freakos(commands.Bot):
 
     async def _restore_persistent_views(self):
         self.add_view(TicketCreateButton())
-        team_panels = await self.db.fetchall(
-            "SELECT * FROM ticket_panels ORDER BY id"
-        )
-        for panel in team_panels:
-            type_row = await self.db.fetchone(
-                "SELECT name, emoji FROM ticket_types WHERE guild_id=? AND id=?",
-                (panel["guild_id"], panel["ticket_type_id"]),
-            )
-            if not type_row:
-                continue
-            guild = self.get_guild(panel["guild_id"])
-            if not guild:
-                continue
-            emoji = _safe_ticket_emoji(guild, type_row["emoji"])
-            self.add_view(
-                TeamApplyPanelView(panel["ticket_type_id"], type_row["name"], emoji),
-                message_id=panel["message_id"],
-            )
         self.add_view(ShopPanelView())
         rows = await self.db.fetchall(
             "SELECT id, guild_id, claimed_by FROM tickets WHERE status='open'")
@@ -2088,14 +1902,16 @@ class Freakos(commands.Bot):
                     "𑣲 Welcome:\n{mention}\n\n"
                     "𑣲 Member Count:\n{member_count}\n\n"
                     "𑣲 Joined At:\n{joined_at}")
+                now_local = datetime.now().astimezone()
                 ph = dict(
-                    name=member.display_name,
                     user=member.name, mention=member.mention,
                     username=member.name, display_name=member.display_name,
-                    server=guild.name, member_count=str(guild.member_count),
+                    name=member.display_name, server=guild.name,
+                    member_count=str(guild.member_count),
                     joined_at=fmt_dt_human(member.joined_at or now_utc()),
                     created_at=member.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
-                    time=now_utc().strftime("%H:%M"))
+                    time=now_local.strftime("Today at %H:%M"),
+                    avatar=member.display_avatar.url)
                 rendered = apply_placeholders(msg_tpl, **ph)
                 embed_cfg = await self.db.get_json(
                     guild.id, "welcome.embed", default={}) or {}
@@ -2138,7 +1954,11 @@ class Freakos(commands.Bot):
                 dm_ph = dict(
                     user=member.name, mention=member.mention,
                     username=member.name, display_name=member.display_name,
-                    server=guild.name, member_count=str(guild.member_count))
+                    name=member.display_name, server=guild.name,
+                    member_count=str(guild.member_count),
+                    created_at=member.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
+                    time=datetime.now().astimezone().strftime("Today at %H:%M"),
+                    avatar=member.display_avatar.url)
                 try:
                     dm_embed = discord.Embed(
                         color=0x5865F2, timestamp=now_utc(),
@@ -2269,6 +2089,8 @@ class Freakos(commands.Bot):
             if old_id == new_id:
                 return
 
+            # One server-wide configuration: the same join/leave templates are
+            # automatically used for EVERY voice channel in this guild.
             if await self.db.get_config(guild.id, "vcnotify.enabled", "1") == "0":
                 return
 
@@ -2276,14 +2098,19 @@ class Freakos(commands.Bot):
             if me is None:
                 return
 
-            async def _fire(cfg_key: str, ch, tpl_default: str, kind: str):
-                # Only voice channels have a built-in text chat (skip stages).
+            join_tpl = await self.db.get_config(
+                guild.id, "vcnotify.join_message",
+                "ᯓ 〻 **{mention}** ᴊᴏɪɴᴇᴅ 𐙚")
+            leave_tpl = await self.db.get_config(
+                guild.id, "vcnotify.leave_message",
+                "ᯓ 〻 **{mention}** ʟᴇғᴛ 𐙚")
+
+            async def _fire(ch, tpl: str, kind: str):
+                # Discord voice channels have their own built-in text chat.
+                # Stages do not, so they are ignored safely.
                 if not isinstance(ch, discord.VoiceChannel):
                     return
-                cfg = await self.db.get_json(guild.id, cfg_key, default={}) or {}
-                if not cfg.get("enabled", True):
-                    return
-                # Make sure we're allowed to post in this VC's own text chat.
+
                 try:
                     perms = ch.permissions_for(me)
                 except Exception:
@@ -2293,15 +2120,18 @@ class Freakos(commands.Bot):
                         "VC notify: missing permission to post in #%s text chat",
                         getattr(ch, "name", getattr(ch, "id", "?")))
                     return
-                tpl = cfg.get(f"{kind}_msg") or tpl_default
+
                 rendered = apply_placeholders(
-                    tpl, mention=member.mention, user=member.name,
+                    tpl or "", mention=member.mention, user=member.name,
                     username=member.name, display_name=member.display_name,
                     channel_name=ch.name, channel_mention=ch.mention,
-                    server=guild.name)
+                    server=guild.name, member_count=str(guild.member_count))
+                if not rendered.strip():
+                    return
+
                 for c in chunk_message(rendered):
                     try:
-                        # Posts into the voice channel's OWN built-in text chat.
+                        # Always post to THIS voice channel's own text chat.
                         await ch.send(c)
                     except discord.Forbidden:
                         log.warning(
@@ -2313,13 +2143,13 @@ class Freakos(commands.Bot):
                             "VC %s notify failed (channel=%s)", kind, ch.id)
                         return
 
-            # Every voice channel works independently — no separate target needed.
-            if old_id and old_ch is not None:
-                await _fire(f"vcnotify.cfg.{old_id}", old_ch,
-                            "👋 {mention} left **{channel_name}**.", "leave")
-            if new_id and new_ch is not None:
-                await _fire(f"vcnotify.cfg.{new_id}", new_ch,
-                            "🎧 {mention} joined **{channel_name}**.", "join")
+            # Leaving: post in the old VC's own chat.
+            if old_ch is not None:
+                await _fire(old_ch, leave_tpl, "leave")
+
+            # Joining: post in the new VC's own chat.
+            if new_ch is not None:
+                await _fire(new_ch, join_tpl, "join")
         except Exception:
             log.exception("VC notify handler crashed")
 
@@ -2585,7 +2415,7 @@ class Freakos(commands.Bot):
     async def _automod_leave_check(self, member: discord.Member):
         """Detect kicks via audit log for anti-nuke."""
         await self._am_nuke_check(
-            member.guild, discord.AuditLogAction.kick, "Kick",
+            member.guild, discord.AuditLogAction.member_kick, "Kick",
             f"kicked {member.mention} ({member})")
 
     async def _am_nuke_check(self, guild: discord.Guild, audit_action,
@@ -2995,13 +2825,75 @@ def register_all_commands(bot: Freakos):
             f"✅ Server logo: **{'on' if enabled else 'off'}**.", ephemeral=True)
 
     @welcome.command(name="message",
-                     description="Set the welcome embed description (supports placeholders and newlines).")
+                     description="Set the welcome embed description (supports newlines).")
     async def w_message(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         current = await db.get_config(interaction.guild.id, "welcome.message", "") or ""
         await interaction.response.send_modal(TextModal(
             title="Welcome Message", default=current,
             on_submit=lambda i, v: _save_and_reply(i, "welcome.message", v)))
+
+    @welcome.command(
+        name="embed",
+        description="Configure the welcome embed. All options are optional.")
+    @app_commands.describe(
+        enabled="Enable or disable the welcome embed",
+        title="Embed title",
+        color="Hex color, for example #8B2CFF",
+        footer="Embed footer text",
+        image="Large image URL",
+        thumbnail="Thumbnail image URL")
+    async def w_embed(
+        interaction: discord.Interaction,
+        enabled: Optional[bool] = None,
+        title: Optional[str] = None,
+        color: Optional[str] = None,
+        footer: Optional[str] = None,
+        image: Optional[str] = None,
+        thumbnail: Optional[str] = None):
+        # Acknowledge immediately so Discord never shows the generic
+        # "The application did not respond" message while DB/config work runs.
+        if not await require_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            gid = interaction.guild.id
+            cfg = await db.get_json(gid, "welcome.embed", default={}) or {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+
+            if enabled is not None:
+                cfg["enabled"] = bool(enabled)
+            if title is not None:
+                cfg["title"] = title[:256]
+            if footer is not None:
+                cfg["footer"] = footer[:2048]
+            if image is not None:
+                cfg["image"] = image.strip()[:2048]
+            if thumbnail is not None:
+                cfg["thumbnail"] = thumbnail.strip()[:2048]
+            if color is not None:
+                raw = color.strip().lstrip("#")
+                if not re.fullmatch(r"[0-9a-fA-F]{6}", raw):
+                    return await interaction.followup.send(
+                        "❌ Invalid color. Use a 6-digit hex color such as `#8B2CFF`.",
+                        ephemeral=True)
+                cfg["color"] = int(raw, 16)
+
+            if not cfg:
+                cfg = {"enabled": True, "color": 0x5865F2}
+            elif "enabled" not in cfg:
+                cfg["enabled"] = True
+            elif "color" not in cfg:
+                cfg["color"] = 0x5865F2
+
+            await db.set_json(gid, "welcome.embed", cfg)
+            await interaction.followup.send(
+                "✅ Welcome embed settings saved.", ephemeral=True)
+        except Exception as e:
+            log.exception("welcome embed command failed")
+            await interaction.followup.send(
+                f"❌ Failed to save welcome embed settings: {e}", ephemeral=True)
 
     @welcome.command(name="test", description="Send a test welcome message/embed.")
     async def w_test(interaction: discord.Interaction):
@@ -3013,16 +2905,18 @@ def register_all_commands(bot: Freakos):
                 "No welcome channel set.", ephemeral=True)
         tpl = await db.get_config(interaction.guild.id, "welcome.message") or \
             "Welcome {mention}!"
+        now_local = datetime.now().astimezone()
         ph = dict(
-            name=interaction.user.display_name,
             user=interaction.user.name, mention=interaction.user.mention,
             username=interaction.user.name,
             display_name=interaction.user.display_name,
+            name=interaction.user.display_name,
             server=interaction.guild.name,
             member_count=str(interaction.guild.member_count),
             joined_at=fmt_dt_human(interaction.user.joined_at or now_utc()),
             created_at=interaction.user.created_at.astimezone(timezone.utc).strftime("%d/%b/%Y"),
-            time=now_utc().strftime("%H:%M"))
+            time=now_local.strftime("Today at %H:%M"),
+            avatar=interaction.user.display_avatar.url)
         rendered = apply_placeholders(tpl, **ph)
         embed_cfg = await db.get_json(
             interaction.guild.id, "welcome.embed", default={}) or {}
@@ -3365,23 +3259,10 @@ def register_all_commands(bot: Freakos):
 
     # ---------------- VC NOTIFICATIONS ----------------
     vcnotify = app_commands.Group(
-        name="vcnotify", description="Voice-channel join/leave notifications")
+        name="vcnotify", description="Server-wide voice-channel join/leave notifications")
     tree.add_command(vcnotify)
 
-    async def _vc_get_cfg(guild_id: int, vc_id: int) -> dict:
-        return await db.get_json(guild_id, f"vcnotify.cfg.{vc_id}", default={}) or {}
-
-    async def _vc_set_cfg(guild_id: int, vc_id: int, cfg: dict):
-        await db.set_json(guild_id, f"vcnotify.cfg.{vc_id}", cfg)
-
-    async def _vc_watched(guild_id: int) -> list:
-        return await db.get_json(guild_id, "vcnotify.channels", default=[]) or []
-
-    async def _vc_set_watched(guild_id: int, watched: list):
-        await db.set_json(guild_id, "vcnotify.channels", watched)
-
     async def _vc_reply_error(interaction: discord.Interaction, msg: str):
-        """Send an error reply whether or not the interaction was already deferred."""
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
@@ -3392,9 +3273,8 @@ def register_all_commands(bot: Freakos):
 
     @vcnotify.command(
         name="setup",
-        description="Enable VC notifications (posted in each voice channel's own text chat).")
+        description="Enable server-wide VC notifications for every voice channel.")
     async def v_setup(interaction: discord.Interaction):
-        # Defer FIRST so Discord always gets an acknowledgement within 3s.
         await interaction.response.defer(ephemeral=True)
         try:
             if not interaction.guild:
@@ -3402,159 +3282,83 @@ def register_all_commands(bot: Freakos):
             if not is_admin_or_mod(interaction.user):
                 return await interaction.followup.send(
                     "You need Manage Server / Administrator.", ephemeral=True)
-
             await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
             await interaction.followup.send(
-                "✅ VC notifications enabled.\n"
-                "Join/leave messages are posted **inside each voice channel's own "
-                "text chat** — no separate text channel needed.\n"
-                "This applies to **every** voice channel automatically "
-                "(General 1, General 2, Gaming, Music, Staff VC, …).\n"
-                "Customise a specific VC with `/vcnotify join-message` and "
-                "`/vcnotify leave-message`.",
+                "✅ VC notifications enabled server-wide.\n"
+                "One join message and one leave message now apply automatically to **every voice channel**.\n"
+                "Messages are posted in each voice channel's own built-in text chat.",
                 ephemeral=True)
         except Exception as e:
             log.exception("vcnotify setup failed")
             await _vc_reply_error(interaction, f"❌ Setup failed: {e}")
 
-    @vcnotify.command(
-        name="add",
-        description="Enable notifications for one voice channel (posts in its own text chat).")
-    @app_commands.describe(voice_channel="Voice channel to enable")
-    async def v_add(interaction: discord.Interaction,
-                    voice_channel: discord.VoiceChannel):
-        # Defer FIRST so Discord always gets an acknowledgement within 3s.
-        await interaction.response.defer(ephemeral=True)
-        try:
-            if not interaction.guild:
-                return await interaction.followup.send("Guild only.", ephemeral=True)
-            if not is_admin_or_mod(interaction.user):
-                return await interaction.followup.send(
-                    "You need Manage Server / Administrator.", ephemeral=True)
-
-            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-            cfg["enabled"] = True
-            await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
-            await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
-            await interaction.followup.send(
-                f"✅ Notifications enabled for {voice_channel.mention}. "
-                "Messages will post in its own text chat.",
-                ephemeral=True)
-        except Exception as e:
-            log.exception("vcnotify add failed")
-            await _vc_reply_error(interaction, f"❌ Failed: {e}")
-
-    @vcnotify.command(
-        name="remove",
-        description="Disable notifications for one voice channel.")
-    @app_commands.describe(voice_channel="Voice channel to silence")
-    async def v_remove(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
-        await interaction.response.defer(ephemeral=True)
-        try:
-            if not interaction.guild:
-                return await interaction.followup.send("Guild only.", ephemeral=True)
-            if not is_admin_or_mod(interaction.user):
-                return await interaction.followup.send(
-                    "You need Manage Server / Administrator.", ephemeral=True)
-
-            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-            cfg["enabled"] = False
-            await _vc_set_cfg(interaction.guild.id, voice_channel.id, cfg)
-            await interaction.followup.send(
-                f"✅ Disabled notifications for {voice_channel.mention}.",
-                ephemeral=True)
-        except Exception as e:
-            log.exception("vcnotify remove failed")
-            await _vc_reply_error(interaction, f"❌ Failed: {e}")
-
-    @vcnotify.command(name="enable", description="Enable VC notifications.")
+    @vcnotify.command(name="enable", description="Enable server-wide VC notifications.")
     async def v_enable(interaction: discord.Interaction):
         if not await require_admin(interaction):
             return
         await interaction.response.defer(ephemeral=True)
         await db.set_config(interaction.guild.id, "vcnotify.enabled", "1")
-        await interaction.followup.send("✅ Enabled.", ephemeral=True)
+        await interaction.followup.send("✅ Enabled for every voice channel.", ephemeral=True)
 
-    @vcnotify.command(name="disable", description="Disable VC notifications.")
+    @vcnotify.command(name="disable", description="Disable server-wide VC notifications.")
     async def v_disable(interaction: discord.Interaction):
         if not await require_admin(interaction):
             return
         await interaction.response.defer(ephemeral=True)
         await db.set_config(interaction.guild.id, "vcnotify.enabled", "0")
-        await interaction.followup.send("✅ Disabled.", ephemeral=True)
+        await interaction.followup.send("✅ Disabled for every voice channel.", ephemeral=True)
 
-    @vcnotify.command(name="list", description="Show VC notification settings.")
+    async def _edit_global_vc_msg(interaction: discord.Interaction, key: str, title: str):
+        if not await require_admin(interaction):
+            return
+        current = await db.get_config(interaction.guild.id, key, "") or ""
+        await interaction.response.send_modal(
+            TextModal(title=title, default=current,
+                      on_submit=lambda i, v: _save_and_reply(i, key, v)))
+
+    @vcnotify.command(
+        name="join-message",
+        description="Set ONE join message used automatically in every voice channel.")
+    async def v_join(interaction: discord.Interaction):
+        await _edit_global_vc_msg(
+            interaction, "vcnotify.join_message", "Global VC Join Message")
+
+    @vcnotify.command(
+        name="leave-message",
+        description="Set ONE leave message used automatically in every voice channel.")
+    async def v_leave(interaction: discord.Interaction):
+        await _edit_global_vc_msg(
+            interaction, "vcnotify.leave_message", "Global VC Leave Message")
+
+    @vcnotify.command(
+        name="list", description="Show the server-wide VC notification settings.")
     async def v_list(interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         try:
             if not interaction.guild:
                 return await interaction.followup.send("Guild only.", ephemeral=True)
-            global_on = await db.get_config(
+            enabled = await db.get_config(
                 interaction.guild.id, "vcnotify.enabled", "1") != "0"
-            lines = [
-                f"**Global state:** {'🟢 enabled' if global_on else '🔴 disabled'}",
-                "Notifications post inside **each voice channel's own text chat** "
-                "(all voice channels, automatically).",
-            ]
-            rows = await db.fetchall(
-                "SELECT key, value FROM guild_config WHERE guild_id=? "
-                "AND key LIKE 'vcnotify.cfg.%'",
-                (interaction.guild.id,))
-            overrides = []
-            for r in rows:
-                cid = str(r["key"]).rsplit(".", 1)[-1]
-                try:
-                    cfg = json.loads(r["value"]) if r["value"] else {}
-                except Exception:
-                    cfg = {}
-                if not isinstance(cfg, dict):
-                    cfg = {}
-                state = "on" if cfg.get("enabled", True) else "off"
-                jm = "✏️ custom" if cfg.get("join_msg") else "default"
-                lm = "✏️ custom" if cfg.get("leave_msg") else "default"
-                overrides.append(
-                    f"• <#{cid}> | per-channel: {state} | join: {jm} | leave: {lm}")
-            if overrides:
-                lines.append("**Per-channel overrides:**")
-                lines.extend(overrides)
-            else:
-                lines.append("*(no per-channel overrides — defaults used everywhere)*")
-            await interaction.followup.send("\n".join(lines), ephemeral=True)
+            join_msg = await db.get_config(
+                interaction.guild.id, "vcnotify.join_message",
+                "ᯓ 〻 **{mention}** ᴊᴏɪɴᴇᴅ 𐙚")
+            leave_msg = await db.get_config(
+                interaction.guild.id, "vcnotify.leave_message",
+                "ᯓ 〻 **{mention}** ʟᴇғᴛ 𐙚")
+            await interaction.followup.send(
+                "**VC Notifications**\n"
+                f"State: {'🟢 enabled' if enabled else '🔴 disabled'}\n"
+                "Scope: **every voice channel automatically**\n\n"
+                f"**Join:** {join_msg[:1000]}\n"
+                f"**Leave:** {leave_msg[:1000]}",
+                ephemeral=True)
         except Exception as e:
             log.exception("vcnotify list failed")
             await _vc_reply_error(interaction, f"❌ Failed: {e}")
 
-    async def _edit_vc_msg(interaction: discord.Interaction,
-                           vc: discord.VoiceChannel, key: str, title: str):
-        if not await require_admin(interaction):
-            return
-        cfg = await _vc_get_cfg(interaction.guild.id, vc.id)
-        current = cfg.get(key) or ""
-
-        async def save(i: discord.Interaction, v: str):
-            cfg2 = await _vc_get_cfg(i.guild.id, vc.id)
-            cfg2[key] = v
-            await _vc_set_cfg(i.guild.id, vc.id, cfg2)
-            await i.response.send_message("✅ Saved.", ephemeral=True)
-
-        await interaction.response.send_modal(
-            TextModal(title=title, default=current, on_submit=save))
-
-    @vcnotify.command(name="join-message",
-                      description="Set the template posted when someone joins.")
-    @app_commands.describe(voice_channel="Voice channel whose template to edit")
-    async def v_join(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
-        await _edit_vc_msg(interaction, voice_channel, "join_msg", "VC Join Message")
-
-    @vcnotify.command(name="leave-message",
-                      description="Set the template posted when someone leaves.")
-    @app_commands.describe(voice_channel="Voice channel whose template to edit")
-    async def v_leave(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
-        await _edit_vc_msg(interaction, voice_channel, "leave_msg", "VC Leave Message")
-
     @vcnotify.command(
         name="test",
-        description="Post a test join + leave message in a VC's own text chat.")
+        description="Test the server-wide messages in a selected voice channel.")
     @app_commands.describe(voice_channel="Voice channel to test")
     async def v_test(interaction: discord.Interaction, voice_channel: discord.VoiceChannel):
         await interaction.response.defer(ephemeral=True)
@@ -3565,16 +3369,20 @@ def register_all_commands(bot: Freakos):
                 return await interaction.followup.send(
                     "You need Manage Server / Administrator.", ephemeral=True)
 
-            cfg = await _vc_get_cfg(interaction.guild.id, voice_channel.id)
-            join_tpl = cfg.get("join_msg") or "🎧 {mention} joined **{channel_name}**."
-            leave_tpl = cfg.get("leave_msg") or "👋 {mention} left **{channel_name}**."
+            join_tpl = await db.get_config(
+                interaction.guild.id, "vcnotify.join_message",
+                "ᯓ 〻 **{mention}** ᴊᴏɪɴᴇᴅ 𐙚")
+            leave_tpl = await db.get_config(
+                interaction.guild.id, "vcnotify.leave_message",
+                "ᯓ 〻 **{mention}** ʟᴇғᴛ 𐙚")
             common = dict(
                 mention=interaction.user.mention, user=interaction.user.name,
                 username=interaction.user.name,
                 display_name=interaction.user.display_name,
                 channel_name=voice_channel.name,
                 channel_mention=voice_channel.mention,
-                server=interaction.guild.name)
+                server=interaction.guild.name,
+                member_count=str(interaction.guild.member_count))
 
             me = interaction.guild.me
             perms = voice_channel.permissions_for(me) if me else None
@@ -3598,25 +3406,34 @@ def register_all_commands(bot: Freakos):
             log.exception("vcnotify test failed")
             await _vc_reply_error(interaction, f"❌ Failed: {e}")
 
-    @vcnotify.command(name="reset", description="Wipe VC-notification config.")
+    @vcnotify.command(name="reset", description="Reset server-wide VC notification settings.")
     async def v_reset(interaction: discord.Interaction):
         if not await require_admin(interaction):
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            await db.set_config(interaction.guild.id, "vcnotify.channels", None)
-            await db.set_config(interaction.guild.id, "vcnotify.enabled", None)
+            for k in (
+                "vcnotify.enabled",
+                "vcnotify.join_message",
+                "vcnotify.leave_message",
+                "vcnotify.channels",
+            ):
+                await db.set_config(interaction.guild.id, k, None)
+
+            # Remove old per-channel configurations so legacy settings cannot
+            # interfere with the new server-wide system.
             rows = await db.fetchall(
                 "SELECT key FROM guild_config WHERE guild_id=? "
                 "AND key LIKE 'vcnotify.cfg.%'",
                 (interaction.guild.id,))
             for r in rows:
                 await db.set_config(interaction.guild.id, r["key"], None)
+
             await interaction.followup.send(
-                "✅ VC-notification config reset.", ephemeral=True)
+                "✅ Server-wide VC notification config reset.", ephemeral=True)
         except Exception as e:
             log.exception("vcnotify reset failed")
-            await interaction.followup.send(f"❌ Failed: {e}", ephemeral=True)
+            await _vc_reply_error(interaction, f"❌ Failed: {e}")
 
     # ---------------- TICKETS ----------------
     ticket = app_commands.Group(name="ticket", description="Ticket system")
@@ -3628,30 +3445,6 @@ def register_all_commands(bot: Freakos):
         await interaction.response.send_message(
             "Use `/ticket type` to add a ticket type, then `/ticket panel` to place the panel.",
             ephemeral=True)
-
-    @ticket.command(
-        name="team-panel",
-        description="Post a panel that opens only one configured ticket type."
-    )
-    async def t_team_panel(
-        interaction: discord.Interaction,
-        ticket_type: str,
-        channel: discord.TextChannel,
-    ):
-        if not await require_admin(interaction):
-            return
-        row = await db.fetchone(
-            "SELECT * FROM ticket_types WHERE guild_id=? AND name=?",
-            (interaction.guild.id, ticket_type),
-        )
-        if not row:
-            return await interaction.response.send_message(
-                "❌ Ticket type not found. Create it first with `/ticket type`.",
-                ephemeral=True,
-            )
-        await interaction.response.send_modal(
-            TeamApplyPanelModal(channel, row["id"])
-        )
 
     @ticket.command(name="panel", description="Post the ticket panel.")
     async def t_panel(interaction: discord.Interaction,
@@ -3876,8 +3669,6 @@ def register_all_commands(bot: Freakos):
     async def t_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.execute("DELETE FROM ticket_types WHERE guild_id=?",
-                         (interaction.guild.id,))
-        await db.execute("DELETE FROM ticket_panels WHERE guild_id=?",
                          (interaction.guild.id,))
         for k in ("ticket.limit", "ticket.cooldown", "ticket.close_delete_delay",
                   "ticket.logs_channel", "ticket.transcript_channel",
