@@ -214,6 +214,11 @@ CREATE TABLE IF NOT EXISTS ticket_types (
     name TEXT NOT NULL, emoji TEXT, category_id INTEGER,
     support_role_id INTEGER, message TEXT, UNIQUE(guild_id, name)
 );
+CREATE TABLE IF NOT EXISTS ticket_panels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+    ticket_type_id INTEGER NOT NULL, UNIQUE(message_id)
+);
 CREATE TABLE IF NOT EXISTS vouches (
     id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL, voucher_id INTEGER NOT NULL,
@@ -500,6 +505,105 @@ class TicketCreateButton(discord.ui.View):
             "Choose a ticket type to open:", view=view, ephemeral=True)
 
 
+class TeamApplyPanelView(discord.ui.View):
+    """Persistent single-type ticket panel. No global ticket list is exposed."""
+
+    def __init__(self, ticket_type_id: int, label: str, emoji: object = None):
+        super().__init__(timeout=None)
+        self.ticket_type_id = ticket_type_id
+        button = discord.ui.Button(
+            label=(label or "Ticket")[:80],
+            emoji=emoji or None,
+            style=discord.ButtonStyle.primary,
+            custom_id=f"freakos:ticket:single:{ticket_type_id}",
+        )
+        button.callback = self._open
+        self.add_item(button)
+
+    async def _open(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        row = await interaction.client.db.fetchone(
+            "SELECT * FROM ticket_types WHERE guild_id=? AND id=?",
+            (interaction.guild.id, self.ticket_type_id),
+        )
+        if not row:
+            return await _safe_reply(
+                interaction,
+                "❌ This ticket type is no longer configured. An administrator must update this panel.",
+            )
+        await _open_ticket(interaction, row["name"])
+
+
+class TeamApplyPanelModal(discord.ui.Modal, title="Ticket Panel"):
+    panel_title = discord.ui.TextInput(
+        label="Panel title", style=discord.TextStyle.short,
+        max_length=256, required=True,
+        placeholder="Enter the title for this panel")
+    panel_description = discord.ui.TextInput(
+        label="Panel description", style=discord.TextStyle.paragraph,
+        max_length=4000, required=True,
+        placeholder="Enter the description for this panel")
+    banner_url = discord.ui.TextInput(
+        label="Banner image URL", style=discord.TextStyle.short,
+        max_length=1000, required=True,
+        placeholder="https://...")
+
+    def __init__(self, channel: discord.TextChannel, ticket_type_id: int):
+        super().__init__()
+        self.channel = channel
+        self.ticket_type_id = ticket_type_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+
+        row = await interaction.client.db.fetchone(
+            "SELECT * FROM ticket_types WHERE guild_id=? AND id=?",
+            (interaction.guild.id, self.ticket_type_id),
+        )
+        if not row:
+            return await interaction.response.send_message(
+                "❌ Ticket type not found.", ephemeral=True
+            )
+
+        emoji = _safe_ticket_emoji(interaction.guild, row["emoji"])
+        embed = make_embed(
+            title=self.panel_title.value,
+            description=self.panel_description.value,
+        )
+        try:
+            embed.set_image(url=self.banner_url.value.strip())
+        except Exception:
+            return await interaction.response.send_message(
+                "❌ Invalid banner URL.", ephemeral=True
+            )
+
+        view = TeamApplyPanelView(row["id"], row["name"], emoji)
+        try:
+            message = await self.channel.send(embed=embed, view=view)
+            await interaction.client.db.execute(
+                "INSERT INTO ticket_panels "
+                "(guild_id, channel_id, message_id, ticket_type_id) VALUES (?, ?, ?, ?)",
+                (interaction.guild.id, self.channel.id, message.id, row["id"]),
+            )
+            interaction.client.add_view(view, message_id=message.id)
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "❌ I cannot post in that channel. Check my permissions.", ephemeral=True
+            )
+        except Exception:
+            log.exception("Failed to post dedicated ticket panel")
+            return await interaction.response.send_message(
+                "❌ Failed to post the ticket panel.", ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            f"✅ Panel posted in {self.channel.mention} for `{row['name']}`.",
+            ephemeral=True,
+        )
+
+
 class TicketPanelModal(discord.ui.Modal, title="Ticket Panel"):
     panel_title = discord.ui.TextInput(
         label="Title", style=discord.TextStyle.short,
@@ -643,11 +747,29 @@ async def _generate_transcript(channel) -> discord.File:
 
 async def _post_ticket_close_log(bot: "Freakos", guild: discord.Guild, channel,
                                  row, closed_by, reason: str):
-    ch_id = await bot.db.get_config(guild.id, "ticket.logs_channel")
-    if not ch_id:
-        return
-    log_ch = guild.get_channel(int(ch_id))
-    if not log_ch:
+    """Post the configured close log and/or transcript destinations.
+
+    Nothing is selected automatically: each guild can configure either or both
+    destinations. If both are configured, the close log is sent to the logs
+    channel and the transcript is also sent to the transcript channel.
+    """
+    logs_raw = await bot.db.get_config(guild.id, "ticket.logs_channel")
+    transcript_raw = await bot.db.get_config(guild.id, "ticket.transcript_channel")
+
+    log_ch = None
+    transcript_ch = None
+    try:
+        if logs_raw:
+            log_ch = guild.get_channel(int(logs_raw))
+    except (TypeError, ValueError):
+        log_ch = None
+    try:
+        if transcript_raw:
+            transcript_ch = guild.get_channel(int(transcript_raw))
+    except (TypeError, ValueError):
+        transcript_ch = None
+
+    if not log_ch and not transcript_ch:
         return
 
     t_num = row["ticket_number"]
@@ -672,10 +794,25 @@ async def _post_ticket_close_log(bot: "Freakos", guild: discord.Guild, channel,
     except Exception:
         pass
 
-    try:
-        await log_ch.send(embed=e, file=await _generate_transcript(channel))
-    except Exception:
-        log.exception("Failed to post ticket close log for ticket %s", row["id"])
+    transcript = None
+    if log_ch or transcript_ch:
+        transcript = await _generate_transcript(channel)
+
+    if log_ch:
+        try:
+            await log_ch.send(embed=e, file=transcript)
+        except Exception:
+            log.exception("Failed to post ticket close log for ticket %s", row["id"])
+
+    if transcript_ch and (not log_ch or transcript_ch.id != log_ch.id):
+        try:
+            transcript = await _generate_transcript(channel)
+            await transcript_ch.send(
+                content=f"📄 Transcript for ticket {ticket_num_str} ({channel.mention})",
+                file=transcript,
+            )
+        except Exception:
+            log.exception("Failed to post ticket transcript for ticket %s", row["id"])
 
 
 async def _ticket_delete_delay(db: "Database", guild_id: int) -> int:
@@ -1873,6 +2010,24 @@ class Freakos(commands.Bot):
 
     async def _restore_persistent_views(self):
         self.add_view(TicketCreateButton())
+        team_panels = await self.db.fetchall(
+            "SELECT * FROM ticket_panels ORDER BY id"
+        )
+        for panel in team_panels:
+            type_row = await self.db.fetchone(
+                "SELECT name, emoji FROM ticket_types WHERE guild_id=? AND id=?",
+                (panel["guild_id"], panel["ticket_type_id"]),
+            )
+            if not type_row:
+                continue
+            guild = self.get_guild(panel["guild_id"])
+            if not guild:
+                continue
+            emoji = _safe_ticket_emoji(guild, type_row["emoji"])
+            self.add_view(
+                TeamApplyPanelView(panel["ticket_type_id"], type_row["name"], emoji),
+                message_id=panel["message_id"],
+            )
         self.add_view(ShopPanelView())
         rows = await self.db.fetchall(
             "SELECT id, guild_id, claimed_by FROM tickets WHERE status='open'")
@@ -3474,6 +3629,30 @@ def register_all_commands(bot: Freakos):
             "Use `/ticket type` to add a ticket type, then `/ticket panel` to place the panel.",
             ephemeral=True)
 
+    @ticket.command(
+        name="team-panel",
+        description="Post a panel that opens only one configured ticket type."
+    )
+    async def t_team_panel(
+        interaction: discord.Interaction,
+        ticket_type: str,
+        channel: discord.TextChannel,
+    ):
+        if not await require_admin(interaction):
+            return
+        row = await db.fetchone(
+            "SELECT * FROM ticket_types WHERE guild_id=? AND name=?",
+            (interaction.guild.id, ticket_type),
+        )
+        if not row:
+            return await interaction.response.send_message(
+                "❌ Ticket type not found. Create it first with `/ticket type`.",
+                ephemeral=True,
+            )
+        await interaction.response.send_modal(
+            TeamApplyPanelModal(channel, row["id"])
+        )
+
     @ticket.command(name="panel", description="Post the ticket panel.")
     async def t_panel(interaction: discord.Interaction,
                       channel: Optional[discord.TextChannel] = None):
@@ -3697,6 +3876,8 @@ def register_all_commands(bot: Freakos):
     async def t_reset(interaction: discord.Interaction):
         if not await require_admin(interaction): return
         await db.execute("DELETE FROM ticket_types WHERE guild_id=?",
+                         (interaction.guild.id,))
+        await db.execute("DELETE FROM ticket_panels WHERE guild_id=?",
                          (interaction.guild.id,))
         for k in ("ticket.limit", "ticket.cooldown", "ticket.close_delete_delay",
                   "ticket.logs_channel", "ticket.transcript_channel",
