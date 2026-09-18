@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -81,6 +82,62 @@ def fmt_duration(seconds: int) -> str:
         return f"{h}h {m}m" if m else f"{h}h"
     d, h = divmod(h, 24)
     return f"{d}d {h}h" if h else f"{d}d"
+
+
+# Discord component emoji sanitizer
+#
+# Ticket/reaction-role emoji values are user-configurable and may have been
+# saved in an invalid format. Passing a malformed custom emoji through to a
+# SelectOption/Button makes Discord reject the entire component payload with
+# error 50035 (Invalid Form Body). Invalid values are therefore ignored
+# instead of taking the whole interaction down.
+_CUSTOM_EMOJI_RE = re.compile(
+    r"^<(a?):([A-Za-z0-9_]{2,32}):(\d{15,25})>$"
+)
+_CUSTOM_EMOJI_BARE_RE = re.compile(
+    r"^(a?):([A-Za-z0-9_]{2,32}):(\d{15,25})$"
+)
+
+def _looks_like_unicode_emoji(value: str) -> bool:
+    # Covers normal emoji, symbols, dingbats, flags, keycaps and ZWJ emoji
+    # without accepting arbitrary text such as ":money:".
+    for ch in value:
+        cp = ord(ch)
+        if (
+            0x1F000 <= cp <= 0x1FAFF
+            or 0x1F1E6 <= cp <= 0x1F1FF
+            or 0x2600 <= cp <= 0x27BF
+            or 0x2300 <= cp <= 0x23FF
+            or 0x2B00 <= cp <= 0x2BFF
+            or unicodedata.category(ch) in {"So", "Sk"}
+        ):
+            return True
+    return False
+
+def safe_component_emoji(raw: Any) -> Optional[Any]:
+    """Return a Discord-safe emoji value or None for invalid input."""
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+
+    match = _CUSTOM_EMOJI_RE.fullmatch(value) or _CUSTOM_EMOJI_BARE_RE.fullmatch(value)
+    if match:
+        animated, name, emoji_id = match.groups()
+        try:
+            return discord.PartialEmoji(
+                name=name, id=int(emoji_id), animated=bool(animated)
+            )
+        except (TypeError, ValueError):
+            return None
+
+    # Anything that looks like a malformed custom emoji is rejected rather
+    # than being sent as a Unicode emoji.
+    if value.startswith("<") or value.endswith(">") or value.count(":") >= 2:
+        return None
+
+    return value if _looks_like_unicode_emoji(value) else None
 
 
 def parse_duration(s: str) -> Optional[int]:
@@ -446,17 +503,32 @@ class TicketCreateButton(discord.ui.View):
         guild = interaction.guild
         if not guild:
             return
+
+        # Acknowledge immediately so database/config work cannot cause an
+        # interaction timeout. The original crash happened while building
+        # the select payload, before Discord could receive a response.
+        await interaction.response.defer(ephemeral=True)
+
         rows = await interaction.client.db.fetchall(
             "SELECT name, emoji FROM ticket_types WHERE guild_id=? ORDER BY id",
             (guild.id,))
         if not rows:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "No ticket types configured. Ask an admin to run `/ticket type`.",
                 ephemeral=True)
             return
-        opts = [discord.SelectOption(
-            label=r["name"][:100], emoji=(r["emoji"] or None),
-            value=r["name"][:100]) for r in rows[:25]]
+        opts = []
+        for r in rows[:25]:
+            raw_emoji = r["emoji"]
+            emoji = safe_component_emoji(raw_emoji)
+            if raw_emoji and emoji is None:
+                log.warning(
+                    "Ignoring invalid ticket emoji for guild %s / type %r: %r",
+                    guild.id, r["name"], raw_emoji
+                )
+            opts.append(discord.SelectOption(
+                label=r["name"][:100], emoji=emoji, value=r["name"][:100]))
+
         select = discord.ui.Select(placeholder="Pick a ticket type…", options=opts)
 
         async def cb(sel_interaction: discord.Interaction):
@@ -465,8 +537,14 @@ class TicketCreateButton(discord.ui.View):
         select.callback = cb
         view = discord.ui.View(timeout=60)
         view.add_item(select)
-        await interaction.response.send_message(
-            "Choose a ticket type to open:", view=view, ephemeral=True)
+        try:
+            await interaction.followup.send(
+                "Choose a ticket type to open:", view=view, ephemeral=True)
+        except Exception:
+            log.exception("Failed to send ticket type selector for guild %s", guild.id)
+            await interaction.followup.send(
+                "❌ I couldn't build the ticket menu. Check the ticket type emojis/configuration.",
+                ephemeral=True)
 
 
 class TicketPanelModal(discord.ui.Modal, title="Ticket Panel"):
@@ -857,7 +935,8 @@ class TicketRoomView(discord.ui.View):
             if not b.get("enabled", True):
                 return
             btn = discord.ui.Button(
-                label=b.get("label", label), emoji=b.get("emoji", emoji) or None,
+                label=b.get("label", label),
+                emoji=safe_component_emoji(b.get("emoji", emoji)),
                 style=_BUTTON_STYLES.get(b.get("style", style_key),
                                          discord.ButtonStyle.secondary),
                 custom_id=custom_id)
@@ -880,7 +959,7 @@ class TicketRoomView(discord.ui.View):
             else:
                 btn = discord.ui.Button(
                     label=claim_cfg.get("label", "Claim"),
-                    emoji=claim_cfg.get("emoji", "🙋") or None,
+                    emoji=safe_component_emoji(claim_cfg.get("emoji", "🙋")),
                     style=_BUTTON_STYLES.get(claim_cfg.get("style", "success"),
                                              discord.ButtonStyle.success),
                     custom_id=f"freakos:tr:claim:{ticket_id}")
@@ -1073,10 +1152,18 @@ class ReactionRoleView(discord.ui.View):
         super().__init__(timeout=None)
         self.panel_id = panel_id
         if mode == "select":
-            opts = [discord.SelectOption(
-                label=r["label"][:100] or f"Role {r['role_id']}",
-                value=str(r["role_id"]),
-                emoji=r.get("emoji") or None) for r in roles[:25]]
+            opts = []
+            for r in roles[:25]:
+                raw_emoji = r.get("emoji")
+                emoji = safe_component_emoji(raw_emoji)
+                if raw_emoji and emoji is None:
+                    log.warning(
+                        "Ignoring invalid reaction-role emoji for panel %s / role %s: %r",
+                        panel_id, r["role_id"], raw_emoji
+                    )
+                opts.append(discord.SelectOption(
+                    label=r["label"][:100] or f"Role {r['role_id']}",
+                    value=str(r["role_id"]), emoji=emoji))
             if opts:
                 sel = discord.ui.Select(
                     placeholder="Toggle a role…", options=opts,
@@ -1088,7 +1175,7 @@ class ReactionRoleView(discord.ui.View):
             for r in roles[:24]:
                 btn = discord.ui.Button(
                     label=(r["label"] or f"Role {r['role_id']}")[:80],
-                    emoji=r.get("emoji") or None,
+                    emoji=safe_component_emoji(r.get("emoji")),
                     style=discord.ButtonStyle.secondary,
                     custom_id=f"freakos:rr:btn:{panel_id}:{r['role_id']}")
                 btn.callback = self._make_toggle(r["role_id"])
@@ -3459,12 +3546,19 @@ def register_all_commands(bot: Freakos):
                      support_role: discord.Role,
                      emoji: Optional[str] = None):
         if not await require_admin(interaction): return
+        clean_emoji = str(emoji).strip() if emoji else None
+        if clean_emoji and safe_component_emoji(clean_emoji) is None:
+            return await interaction.response.send_message(
+                "❌ Invalid emoji. Use a normal Unicode emoji (for example 🎫) "
+                "or a valid custom emoji such as `<:name:123456789012345678>`.",
+                ephemeral=True)
+
         await db.execute(
             "INSERT INTO ticket_types (guild_id, name, emoji, category_id, support_role_id) "
             "VALUES (?, ?, ?, ?, ?) ON CONFLICT(guild_id, name) DO UPDATE SET "
             "emoji=excluded.emoji, category_id=excluded.category_id, "
             "support_role_id=excluded.support_role_id",
-            (interaction.guild.id, name, emoji, category.id, support_role.id))
+            (interaction.guild.id, name, clean_emoji, category.id, support_role.id))
         await interaction.response.send_message(
             f"✅ Ticket type `{name}` saved.", ephemeral=True)
 
@@ -4770,11 +4864,17 @@ def register_all_commands(bot: Freakos):
                      role: discord.Role, label: Optional[str] = None,
                      emoji: Optional[str] = None):
         if not await require_admin(interaction): return
+        clean_emoji = str(emoji).strip() if emoji else None
+        if clean_emoji and safe_component_emoji(clean_emoji) is None:
+            return await interaction.response.send_message(
+                "❌ Invalid emoji. Use a normal Unicode emoji or a valid custom emoji.",
+                ephemeral=True)
+
         await db.execute(
             "INSERT INTO reaction_roles (panel_id, role_id, label, emoji) "
             "VALUES (?, ?, ?, ?) ON CONFLICT(panel_id, role_id) DO UPDATE SET "
             "label=excluded.label, emoji=excluded.emoji",
-            (panel_id, role.id, label or role.name, emoji))
+            (panel_id, role.id, label or role.name, clean_emoji))
         await interaction.response.send_message(
             "✅ Added (re-post panel to update).", ephemeral=True)
 
