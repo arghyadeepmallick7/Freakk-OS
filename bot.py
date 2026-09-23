@@ -1914,18 +1914,26 @@ class Freakos(commands.Bot):
 
         # Force-sync commands to Discord (fixes CommandSignatureMismatch and
         # ensures edited commands like /vcnotify setup & add are pushed live).
-        try:
-            synced = await self.tree.sync()
-            log.info("Synced %d slash commands (global)", len(synced))
-        except Exception:
-            log.exception("Global command sync failed")
-            for g in list(self.guilds):
-                try:
-                    self.tree.copy_global_to(guild=g)
-                    await self.tree.sync(guild=g)
-                    log.info("Synced commands for guild %s", g.id)
-                except Exception:
-                    log.exception("Guild sync failed for %s", g.id)
+        #
+        # IMPORTANT: we only ever sync the GLOBAL command set. We never fall
+        # back to copy_global_to() + per-guild sync, because that creates a
+        # second, independent registration (a guild-specific override) that
+        # sits next to the global one. Discord then shows both as separate
+        # entries with the same name ("duplicate" commands), and only one of
+        # them is wired to whatever code is currently running. If a global
+        # sync fails, we just retry global sync with backoff instead of
+        # creating that second surface.
+        for attempt in range(3):
+            try:
+                synced = await self.tree.sync()
+                log.info("Synced %d slash commands (global)", len(synced))
+                break
+            except Exception:
+                log.exception("Global command sync failed (attempt %d/3)", attempt + 1)
+                await asyncio.sleep(5 * (attempt + 1))
+        else:
+            log.error("Global command sync did not succeed after 3 attempts; "
+                       "commands may be stale until the next successful sync.")
 
     async def _restore_persistent_views(self):
         self.add_view(TicketCreateButton())
@@ -1962,6 +1970,25 @@ class Freakos(commands.Bot):
                 type=discord.ActivityType.watching, name="over the server"))
         except Exception:
             pass
+
+        if os.getenv("CLEAR_STALE_GUILD_COMMANDS", "0") == "1":
+            # One-time cleanup: earlier deploys of this bot fell back to
+            # copy_global_to() + per-guild sync whenever the global sync
+            # failed. That left a second, independent set of commands
+            # registered directly against some guilds (e.g. a leftover
+            # "/ticket reset" alongside the current global one), which is
+            # why some commands show up twice and only one copy works.
+            # This wipes those per-guild overrides so only the single
+            # global command set remains. Set CLEAR_STALE_GUILD_COMMANDS=0
+            # (or remove the var) after confirming the duplicates are gone
+            # so this doesn't spend API calls on every future restart.
+            for g in list(self.guilds):
+                try:
+                    self.tree.clear_commands(guild=g)
+                    await self.tree.sync(guild=g)
+                    log.info("Cleared stale guild-specific commands for %s", g.id)
+                except Exception:
+                    log.exception("Failed clearing guild commands for %s", g.id)
 
     async def task_timeout_end(self, payload: dict):
         await _run_timeout_end(self, payload)
