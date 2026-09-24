@@ -3,3 +3,4 @@ discord.py>=2.3.2
 aiosqlite>=0.19.0
 python-dotenv>=1.0.0
 pytz>=2023.3
+qrcode[pil]>=8.0.0
