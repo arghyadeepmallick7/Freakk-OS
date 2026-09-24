@@ -330,6 +330,14 @@ CREATE TABLE IF NOT EXISTS automod_violations (
 );
 CREATE INDEX IF NOT EXISTS idx_automod_guild ON automod_violations(guild_id);
 CREATE INDEX IF NOT EXISTS idx_automod_user ON automod_violations(guild_id, user_id);
+
+CREATE TABLE IF NOT EXISTS qr_codes (
+    user_id INTEGER PRIMARY KEY,
+    file_name TEXT NOT NULL,
+    original_name TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -408,6 +416,85 @@ class Database:
     async def set_json(self, guild_id: int, key: str, value):
         await self.set_config(guild_id, key, json.dumps(value))
 
+
+
+# =====================================================================
+# Personal UPI QR system
+# =====================================================================
+
+QR_MAX_BYTES = 8 * 1024 * 1024
+QR_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+def _qr_storage_dir() -> str:
+    """Return the persistent QR directory beside the configured database."""
+    db_abs = os.path.abspath(DB_PATH)
+    base = os.path.dirname(db_abs) or os.getcwd()
+    path = os.path.join(base, "qr")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _qr_extension(attachment: discord.Attachment) -> Optional[str]:
+    """Return a safe supported image extension for an uploaded attachment."""
+    name = (attachment.filename or "").lower()
+    ext = os.path.splitext(name)[1]
+    if ext not in QR_ALLOWED_EXTENSIONS:
+        return None
+
+    content_type = (attachment.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        return None
+
+    return ".jpg" if ext == ".jpeg" else ext
+
+async def _qr_save_attachment(attachment: discord.Attachment, user_id: int) -> tuple[str, str]:
+    """Save a user's QR image and return (stored filename, original filename)."""
+    ext = _qr_extension(attachment)
+    if ext is None:
+        raise ValueError("unsupported_type")
+
+    if attachment.size > QR_MAX_BYTES:
+        raise ValueError("too_large")
+
+    data = await attachment.read()
+    if not data:
+        raise ValueError("empty")
+
+    if len(data) > QR_MAX_BYTES:
+        raise ValueError("too_large")
+
+    directory = _qr_storage_dir()
+    file_name = f"{int(user_id)}{ext}"
+    path = os.path.join(directory, file_name)
+
+    # Remove any old QR files for this user, including an old extension.
+    for old_ext in QR_ALLOWED_EXTENSIONS:
+        old_path = os.path.join(directory, f"{int(user_id)}{old_ext}")
+        if os.path.abspath(old_path) != os.path.abspath(path):
+            try:
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+            except OSError:
+                log.warning("Could not remove old QR file %s", old_path)
+
+    await asyncio.to_thread(Path(path).write_bytes, data)
+    return file_name, attachment.filename or file_name
+
+async def _qr_file_path(file_name: str) -> Optional[str]:
+    """Resolve a stored QR filename safely inside the QR directory."""
+    if not file_name:
+        return None
+    # The database should only contain bot-created filenames. Keep this check
+    # anyway so a corrupted database cannot make the bot read arbitrary files.
+    safe_name = os.path.basename(file_name)
+    if safe_name != file_name:
+        return None
+    if os.path.splitext(safe_name)[1].lower() not in QR_ALLOWED_EXTENSIONS:
+        return None
+    path = os.path.abspath(os.path.join(_qr_storage_dir(), safe_name))
+    root = os.path.abspath(_qr_storage_dir()) + os.sep
+    if not path.startswith(root):
+        return None
+    return path if os.path.isfile(path) else None
 
 # =====================================================================
 # Scheduler
@@ -2737,6 +2824,177 @@ def register_all_commands(bot: Freakos):
                 "You need Manage Server / Administrator.", ephemeral=True)
             return False
         return True
+
+
+    # ---------------- PERSONAL UPI QR ----------------
+    @tree.command(name="qr", description="View your QR or upload one to save it.")
+    @app_commands.describe(image="Optional: upload a UPI QR image to save or replace it.")
+    async def qr_command(interaction: discord.Interaction, image: Optional[discord.Attachment] = None):
+        # `/qr` with no image = show. `/qr image:<file>` = save/replace.
+        # A QR is personal account data, so the entire flow is ephemeral.
+        if image is None:
+            return await _qr_show(interaction)
+
+        # Save/replace the user's personal QR.
+
+        ext = _qr_extension(image)
+        if ext is None:
+            return await interaction.response.send_message(
+                "❌ Invalid file. Upload a PNG, JPG/JPEG, or WEBP image.",
+                ephemeral=True)
+
+        if image.size > QR_MAX_BYTES:
+            return await interaction.response.send_message(
+                f"❌ The QR image is too large. Maximum size is {QR_MAX_BYTES // (1024 * 1024)} MB.",
+                ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        db: Database = interaction.client.db
+        old = await db.fetchone(
+            "SELECT file_name FROM qr_codes WHERE user_id=?",
+            (interaction.user.id,))
+        old_path = None
+        if old:
+            old_path = await _qr_file_path(old["file_name"])
+
+        try:
+            file_name, original_name = await _qr_save_attachment(
+                image, interaction.user.id)
+        except ValueError as exc:
+            code = str(exc)
+            if code == "too_large":
+                msg = f"❌ The QR image is too large. Maximum size is {QR_MAX_BYTES // (1024 * 1024)} MB."
+            elif code == "empty":
+                msg = "❌ The uploaded image is empty or could not be read."
+            else:
+                msg = "❌ Invalid file. Upload a PNG, JPG/JPEG, or WEBP image."
+            return await interaction.followup.send(msg, ephemeral=True)
+        except (discord.HTTPException, discord.Forbidden):
+            log.exception("Failed to download QR for user %s", interaction.user.id)
+            return await interaction.followup.send(
+                "❌ I couldn't download that image from Discord. Please try again.",
+                ephemeral=True)
+        except Exception:
+            log.exception("Unexpected QR upload error for user %s", interaction.user.id)
+            return await interaction.followup.send(
+                "❌ Something went wrong while saving your QR. Please try again.",
+                ephemeral=True)
+
+        now = iso(now_utc())
+        await db.execute(
+            "INSERT INTO qr_codes (user_id, file_name, original_name, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "file_name=excluded.file_name, original_name=excluded.original_name, "
+            "updated_at=excluded.updated_at",
+            (interaction.user.id, file_name, original_name, now, now))
+
+        # If the database pointed at a previous file and it was not already
+        # removed during replacement, remove it now.
+        if old_path:
+            try:
+                if os.path.abspath(old_path) != os.path.abspath(
+                        os.path.join(_qr_storage_dir(), file_name)):
+                    os.remove(old_path)
+            except OSError:
+                pass
+
+        await interaction.followup.send(
+            "# 💳 QR SAVED\n\n"
+            "**Your personal UPI QR has been saved successfully.**\n\n"
+            "`〻` Use `/qr` to view it.\n"
+            "`〻` Use `/qr with your image attached` anytime to replace it.\n"
+            "`〻` Use `/qr remove` to delete it.",
+            ephemeral=True)
+
+    async def _qr_show(interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone(
+            "SELECT * FROM qr_codes WHERE user_id=?",
+            (interaction.user.id,))
+
+        if not row:
+            return await interaction.response.send_message(
+                "# 💳 QR NOT SET\n\n"
+                "**You haven't added your UPI QR yet.**\n\n"
+                "Use `/qr with your image attached` and upload your QR image.",
+                ephemeral=True)
+
+        path = await _qr_file_path(row["file_name"])
+        if not path:
+            # Keep the database tidy if the stored file was manually removed.
+            await db.execute("DELETE FROM qr_codes WHERE user_id=?",
+                             (interaction.user.id,))
+            return await interaction.response.send_message(
+                "❌ Your saved QR file could not be found. Please use `/qr with your image attached` to upload it again.",
+                ephemeral=True)
+
+        await interaction.response.send_message(
+            content=f"# 💳 {interaction.user.display_name}'s UPI QR\n\n"
+                    "**Scan the QR below to make the payment.**\n\n"
+                    "`〻` Use `/qr with your image attached` to replace this QR.\n"
+                    "`〻` Use `/qr remove` to delete it.",
+            file=discord.File(path, filename=os.path.basename(path)),
+            ephemeral=True)
+
+    @tree.command(name="qr_remove", description="Delete your saved personal UPI QR.")
+    async def qr_remove(interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone(
+            "SELECT file_name FROM qr_codes WHERE user_id=?",
+            (interaction.user.id,))
+        if not row:
+            return await interaction.response.send_message(
+                "❌ You don't have a saved UPI QR.", ephemeral=True)
+
+        path = await _qr_file_path(row["file_name"])
+        await db.execute("DELETE FROM qr_codes WHERE user_id=?",
+                         (interaction.user.id,))
+
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                log.warning("Could not remove QR file %s", path)
+
+        await interaction.response.send_message(
+            "# 〻 QR REMOVED\n\n"
+            "**Your saved UPI QR has been deleted.**\n\n"
+            "Use `/qr with your image attached` to add a new one.",
+            ephemeral=True)
+
+    @tree.command(name="qr_info", description="Check your personal UPI QR status.")
+    async def qr_info(interaction: discord.Interaction):
+        db: Database = interaction.client.db
+        row = await db.fetchone(
+            "SELECT created_at, updated_at, file_name FROM qr_codes WHERE user_id=?",
+            (interaction.user.id,))
+
+        if not row:
+            return await interaction.response.send_message(
+                "# 💳 QR STATUS\n\n"
+                "**Status:** `Not configured`\n\n"
+                "Use `/qr with your image attached` to add your personal UPI QR.",
+                ephemeral=True)
+
+        path = await _qr_file_path(row["file_name"])
+        if not path:
+            await db.execute("DELETE FROM qr_codes WHERE user_id=?",
+                             (interaction.user.id,))
+            return await interaction.response.send_message(
+                "# 💳 QR STATUS\n\n"
+                "**Status:** `Not configured`\n\n"
+                "The previous QR file was unavailable. Use `/qr with your image attached` to upload it again.",
+                ephemeral=True)
+
+        await interaction.response.send_message(
+            "# 💳 QR STATUS\n\n"
+            "**Status:** `Configured`\n"
+            f"**Added:** `{fmt_dt_human(parse_iso(row['created_at']))}`\n"
+            f"**Updated:** `{fmt_dt_human(parse_iso(row['updated_at']))}`\n\n"
+            "`〻` Use `/qr` to display your QR.",
+            ephemeral=True)
 
     @tree.error
     async def _on_command_error(interaction: discord.Interaction,
