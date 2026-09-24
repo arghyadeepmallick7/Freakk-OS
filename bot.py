@@ -11,14 +11,10 @@ import os
 import random
 import re
 import unicodedata
-from decimal import Decimal, InvalidOperation
-from pathlib import Path
-from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import aiosqlite
-import qrcode
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -334,18 +330,6 @@ CREATE TABLE IF NOT EXISTS automod_violations (
 );
 CREATE INDEX IF NOT EXISTS idx_automod_guild ON automod_violations(guild_id);
 CREATE INDEX IF NOT EXISTS idx_automod_user ON automod_violations(guild_id, user_id);
-
-CREATE TABLE IF NOT EXISTS qr_codes (
-    user_id INTEGER PRIMARY KEY,
-    file_name TEXT NOT NULL,
-    original_name TEXT,
-    upi_id TEXT,
-    payee_name TEXT,
-    amount REAL,
-    payload TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
 """
 
 
@@ -368,10 +352,6 @@ class Database:
         for stmt in (
             "ALTER TABLE tickets ADD COLUMN close_reason TEXT",
             "ALTER TABLE tickets ADD COLUMN ticket_number INTEGER",
-            "ALTER TABLE qr_codes ADD COLUMN upi_id TEXT",
-            "ALTER TABLE qr_codes ADD COLUMN payee_name TEXT",
-            "ALTER TABLE qr_codes ADD COLUMN amount REAL",
-            "ALTER TABLE qr_codes ADD COLUMN payload TEXT",
         ):
             try:
                 await self.conn.execute(stmt)
@@ -428,100 +408,6 @@ class Database:
     async def set_json(self, guild_id: int, key: str, value):
         await self.set_config(guild_id, key, json.dumps(value))
 
-
-
-# =====================================================================
-# Personal UPI QR system
-# =====================================================================
-
-QR_MAX_BYTES = 8 * 1024 * 1024
-QR_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-QR_MAX_AMOUNT = Decimal("10000000")
-
-def _qr_storage_dir() -> str:
-    """Return the persistent QR directory beside the configured database."""
-    db_abs = os.path.abspath(DB_PATH)
-    base = os.path.dirname(db_abs) or os.getcwd()
-    path = os.path.join(base, "qr")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-def _qr_upi_payload(upi_id: str, payee_name: str, amount: Optional[Decimal]) -> str:
-    """Build a standard UPI payment deep-link for a QR code."""
-    params = [
-        ("pa", upi_id),
-        ("pn", payee_name),
-        ("cu", "INR"),
-    ]
-    if amount is not None:
-        params.insert(2, ("am", format(amount, ".2f")))
-    return "upi://pay?" + "&".join(
-        f"{key}={quote(str(value), safe='')}" for key, value in params
-    )
-
-def _qr_validate_upi_id(value: str) -> Optional[str]:
-    upi = (value or "").strip()
-    # Keep validation deliberately permissive for real-world UPI handles while
-    # rejecting spaces and malformed values that cannot be useful in a QR.
-    if len(upi) > 255 or not re.fullmatch(r"[^\s@]+@[^\s@]+", upi):
-        return None
-    return upi
-
-def _qr_parse_amount(value: Optional[str]) -> Optional[Decimal]:
-    if value is None or not str(value).strip():
-        return None
-    try:
-        amount = Decimal(str(value).strip())
-    except (InvalidOperation, ValueError):
-        return None
-    if not amount.is_finite() or amount <= 0 or amount > QR_MAX_AMOUNT:
-        return None
-    return amount.quantize(Decimal("0.01"))
-
-def _qr_render_png(payload: str, path: str) -> None:
-    """Generate a scannable PNG QR from the UPI payload."""
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=12,
-        border=4,
-    )
-    qr.add_data(payload)
-    qr.make(fit=True)
-    image = qr.make_image()
-    image.save(path, format="PNG")
-
-async def _qr_generate_for_user(
-    user_id: int,
-    upi_id: str,
-    payee_name: str,
-    amount: Optional[Decimal],
-) -> tuple[str, str]:
-    """Generate and persist a user's UPI QR. Returns (filename, payload)."""
-    directory = _qr_storage_dir()
-    file_name = f"{int(user_id)}.png"
-    path = os.path.join(directory, file_name)
-
-    # Generate off the event loop because QR rendering/image encoding is CPU work.
-    await asyncio.to_thread(
-        _qr_render_png,
-        _qr_upi_payload(upi_id, payee_name, amount),
-        path,
-    )
-    return file_name, _qr_upi_payload(upi_id, payee_name, amount)
-
-async def _qr_file_path(file_name: str) -> Optional[str]:
-    """Resolve a stored QR filename safely inside the QR directory."""
-    if not file_name:
-        return None
-    safe_name = os.path.basename(file_name)
-    if safe_name != file_name or os.path.splitext(safe_name)[1].lower() != ".png":
-        return None
-    path = os.path.abspath(os.path.join(_qr_storage_dir(), safe_name))
-    root = os.path.abspath(_qr_storage_dir()) + os.sep
-    if not path.startswith(root):
-        return None
-    return path if os.path.isfile(path) else None
 
 # =====================================================================
 # Scheduler
@@ -2028,26 +1914,18 @@ class Freakos(commands.Bot):
 
         # Force-sync commands to Discord (fixes CommandSignatureMismatch and
         # ensures edited commands like /vcnotify setup & add are pushed live).
-        #
-        # IMPORTANT: we only ever sync the GLOBAL command set. We never fall
-        # back to copy_global_to() + per-guild sync, because that creates a
-        # second, independent registration (a guild-specific override) that
-        # sits next to the global one. Discord then shows both as separate
-        # entries with the same name ("duplicate" commands), and only one of
-        # them is wired to whatever code is currently running. If a global
-        # sync fails, we just retry global sync with backoff instead of
-        # creating that second surface.
-        for attempt in range(3):
-            try:
-                synced = await self.tree.sync()
-                log.info("Synced %d slash commands (global)", len(synced))
-                break
-            except Exception:
-                log.exception("Global command sync failed (attempt %d/3)", attempt + 1)
-                await asyncio.sleep(5 * (attempt + 1))
-        else:
-            log.error("Global command sync did not succeed after 3 attempts; "
-                       "commands may be stale until the next successful sync.")
+        try:
+            synced = await self.tree.sync()
+            log.info("Synced %d slash commands (global)", len(synced))
+        except Exception:
+            log.exception("Global command sync failed")
+            for g in list(self.guilds):
+                try:
+                    self.tree.copy_global_to(guild=g)
+                    await self.tree.sync(guild=g)
+                    log.info("Synced commands for guild %s", g.id)
+                except Exception:
+                    log.exception("Guild sync failed for %s", g.id)
 
     async def _restore_persistent_views(self):
         self.add_view(TicketCreateButton())
@@ -2084,25 +1962,6 @@ class Freakos(commands.Bot):
                 type=discord.ActivityType.watching, name="over the server"))
         except Exception:
             pass
-
-        if os.getenv("CLEAR_STALE_GUILD_COMMANDS", "0") == "1":
-            # One-time cleanup: earlier deploys of this bot fell back to
-            # copy_global_to() + per-guild sync whenever the global sync
-            # failed. That left a second, independent set of commands
-            # registered directly against some guilds (e.g. a leftover
-            # "/ticket reset" alongside the current global one), which is
-            # why some commands show up twice and only one copy works.
-            # This wipes those per-guild overrides so only the single
-            # global command set remains. Set CLEAR_STALE_GUILD_COMMANDS=0
-            # (or remove the var) after confirming the duplicates are gone
-            # so this doesn't spend API calls on every future restart.
-            for g in list(self.guilds):
-                try:
-                    self.tree.clear_commands(guild=g)
-                    await self.tree.sync(guild=g)
-                    log.info("Cleared stale guild-specific commands for %s", g.id)
-                except Exception:
-                    log.exception("Failed clearing guild commands for %s", g.id)
 
     async def task_timeout_end(self, payload: dict):
         await _run_timeout_end(self, payload)
@@ -2852,198 +2711,14 @@ def register_all_commands(bot: Freakos):
             return False
         return True
 
-
-    # ---------------- PERSONAL UPI QR ----------------
-    # This command intentionally works in guilds AND bot DMs. Discord supports
-    # global commands in bot DMs when the command/app contexts allow it.
-    @tree.command(name="qr", description="Set up, view, or update your personal UPI QR.")
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    @app_commands.describe(
-        upi_id="Your UPI ID, for example name@upi",
-        amount="Optional fixed amount in INR, for example 100"
-    )
-    async def qr_command(
-        interaction: discord.Interaction,
-        upi_id: Optional[str] = None,
-        amount: Optional[str] = None,
-    ):
-        db: Database = interaction.client.db
-        ephemeral = interaction.guild is not None
-
-        # `/qr` with no arguments = show the saved QR.
-        # `/qr upi_id:... amount:100` = generate a fixed-amount QR.
-        if upi_id is None and amount is None:
-            row = await db.fetchone(
-                "SELECT * FROM qr_codes WHERE user_id=?",
-                (interaction.user.id,),
-            )
-            if not row:
-                return await interaction.response.send_message(
-                    "# 💳 QR NOT SET\n\n"
-                    "**You haven't configured your UPI QR yet.**\n\n"
-                    "Use `/qr` with your **upi_id** and optional **amount**.\n\n"
-                    "Example: `/qr upi_id:yourname@upi amount:100`",
-                    ephemeral=ephemeral,
-                )
-
-            path = await _qr_file_path(row["file_name"])
-            if not path:
-                await db.execute("DELETE FROM qr_codes WHERE user_id=?",
-                                 (interaction.user.id,))
-                return await interaction.response.send_message(
-                    "❌ Your saved QR file is missing. Please configure it again with `/qr`.",
-                    ephemeral=ephemeral,
-                )
-
-            fixed_amount = row["amount"]
-            amount_text = (f"₹{float(fixed_amount):,.2f}"
-                           if fixed_amount is not None else "User enters amount")
-            await interaction.response.send_message(
-                content=(
-                    f"# 💳 {interaction.user.display_name}'s UPI QR\n\n"
-                    f"**UPI ID:** `{row['upi_id'] or '—'}`\n"
-                    f"**Amount:** `{amount_text}`\n\n"
-                    "Scan the QR to pay.\n\n"
-                    "`〻` Use `/qr` with a new UPI ID to replace it.\n"
-                    "`〻` Use `/qr_remove` to delete it."
-                ),
-                file=discord.File(path, filename=os.path.basename(path)),
-                ephemeral=ephemeral,
-            )
-            return
-
-        if not upi_id:
-            return await interaction.response.send_message(
-                "❌ Please provide your **upi_id**.", ephemeral=ephemeral)
-
-        clean_upi = _qr_validate_upi_id(upi_id)
-        if not clean_upi:
-            return await interaction.response.send_message(
-                "❌ Invalid UPI ID. Example: `yourname@upi`",
-                ephemeral=ephemeral,
-            )
-
-        if amount is not None and not str(amount).strip():
-            amount = None
-        parsed_amount = _qr_parse_amount(amount)
-        if amount is not None and parsed_amount is None:
-            return await interaction.response.send_message(
-                f"❌ Invalid amount. Enter a positive amount up to ₹{QR_MAX_AMOUNT:,.0f}. Example: `100`.",
-                ephemeral=ephemeral,
-            )
-
-        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
-
-        payee_name = (interaction.user.display_name or interaction.user.name or "UPI User").strip()[:99]
-        old = await db.fetchone(
-            "SELECT file_name FROM qr_codes WHERE user_id=?",
-            (interaction.user.id,),
-        )
-        old_path = await _qr_file_path(old["file_name"]) if old else None
-
-        try:
-            file_name, payload = await _qr_generate_for_user(
-                interaction.user.id, clean_upi, payee_name, parsed_amount)
-            now = iso(now_utc())
-            await db.execute(
-                "INSERT INTO qr_codes "
-                "(user_id, file_name, original_name, upi_id, payee_name, amount, payload, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(user_id) DO UPDATE SET "
-                "file_name=excluded.file_name, original_name=excluded.original_name, "
-                "upi_id=excluded.upi_id, payee_name=excluded.payee_name, amount=excluded.amount, "
-                "payload=excluded.payload, updated_at=excluded.updated_at",
-                (interaction.user.id, file_name, file_name, clean_upi, payee_name,
-                 float(parsed_amount) if parsed_amount is not None else None, payload, now, now),
-            )
-        except Exception:
-            log.exception("Failed to generate/save UPI QR for user %s", interaction.user.id)
-            return await interaction.followup.send(
-                "❌ Something went wrong while generating your QR. Please try again.",
-                ephemeral=ephemeral,
-            )
-
-        if old_path and os.path.abspath(old_path) != os.path.abspath(
-                os.path.join(_qr_storage_dir(), file_name)):
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
-
-        amount_text = (f"₹{parsed_amount:,.2f}"
-                       if parsed_amount is not None else "No fixed amount")
-        await interaction.followup.send(
-            "# 💳 QR SAVED\n\n"
-            "**Your UPI QR has been generated successfully.**\n\n"
-            f"`〻` **UPI ID:** `{clean_upi}`\n"
-            f"`〻` **Amount:** `{amount_text}`\n\n"
-            "`〻` `/qr` → show your QR\n"
-            "`〻` `/qr upi_id:... amount:...` → update it\n"
-            "`〻` `/qr_remove` → delete it",
-            ephemeral=ephemeral,
-        )
-
-    @tree.command(name="qr_remove", description="Delete your saved personal UPI QR.")
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def qr_remove(interaction: discord.Interaction):
-        db: Database = interaction.client.db
-        ephemeral = interaction.guild is not None
-        row = await db.fetchone(
-            "SELECT file_name FROM qr_codes WHERE user_id=?",
-            (interaction.user.id,),
-        )
-        if not row:
-            return await interaction.response.send_message(
-                "❌ You don't have a saved UPI QR.", ephemeral=ephemeral)
-
-        path = await _qr_file_path(row["file_name"])
-        await db.execute("DELETE FROM qr_codes WHERE user_id=?",
-                         (interaction.user.id,))
-        if path:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        await interaction.response.send_message(
-            "# 〻 QR REMOVED\n\n"
-            "**Your saved UPI QR has been deleted.**",
-            ephemeral=ephemeral,
-        )
-
-    @tree.command(name="qr_info", description="Check your personal UPI QR status.")
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def qr_info(interaction: discord.Interaction):
-        db: Database = interaction.client.db
-        ephemeral = interaction.guild is not None
-        row = await db.fetchone(
-            "SELECT upi_id, amount, payee_name, updated_at, file_name FROM qr_codes WHERE user_id=?",
-            (interaction.user.id,),
-        )
-        if not row:
-            return await interaction.response.send_message(
-                "# 💳 QR STATUS\n\n**Status:** `Not configured`\n\n"
-                "Use `/qr` with your UPI ID to create one.",
-                ephemeral=ephemeral,
-            )
-        path = await _qr_file_path(row["file_name"])
-        if not path:
-            await db.execute("DELETE FROM qr_codes WHERE user_id=?",
-                             (interaction.user.id,))
-            return await interaction.response.send_message(
-                "❌ Your QR file is missing. Please configure it again with `/qr`.",
-                ephemeral=ephemeral,
-            )
-        amount_text = (f"₹{float(row['amount']):,.2f}"
-                       if row["amount"] is not None else "No fixed amount")
-        await interaction.response.send_message(
-            "# 💳 QR STATUS\n\n"
-            "**Status:** `Configured`\n"
-            f"**UPI ID:** `{row['upi_id'] or '—'}`\n"
-            f"**Amount:** `{amount_text}`\n"
-            f"**Name:** `{row['payee_name'] or '—'}`\n"
-            f"**Updated:** `{row['updated_at']}`",
-            ephemeral=ephemeral,
-        )
+    @tree.error
+    async def _on_command_error(interaction: discord.Interaction,
+                                error: app_commands.AppCommandError):
+        # discord.py 2.x does NOT dispatch on_app_command_error automatically —
+        # the tree error hook is the only place app-command errors surface, so
+        # route it to the rich client handler (which also answers the
+        # interaction to avoid "The application did not respond").
+        await bot.on_app_command_error(interaction, error)
 
     # ---------------- GENERAL ----------------
     @tree.command(name="ping", description="Show bot latency.")
