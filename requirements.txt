@@ -1,6 +1,4 @@
-# FREAKOS Dependencies
-discord.py>=2.3.2
-aiosqlite>=0.19.0
-python-dotenv>=1.0.0
-pytz>=2023.3
-qrcode[pil]>=8.0.0
+discord.py>=2.4.0,<3.0
+aiosqlite>=0.20.0
+python-dotenv>=1.0.1
+qrcode[pil]>=7.4.2
