@@ -5,6 +5,7 @@ Uses discord.py 2.x (NOT py-cord). Everything is inside this file.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -12,6 +13,8 @@ import random
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from urllib.parse import urlencode
 from typing import Any, Optional
 
 import aiosqlite
@@ -19,11 +22,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+import qrcode
+from PIL import Image
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 DB_PATH = os.getenv("DB_PATH", "data/freakos.db")
+QR_CUSTOM_DIR = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "qr_custom")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -323,6 +329,13 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     completed INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(completed, run_at);
+CREATE TABLE IF NOT EXISTS qr_profiles (
+    user_id INTEGER PRIMARY KEY,
+    upi_id TEXT NOT NULL,
+    custom_qr_path TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS automod_violations (
     id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL, rule TEXT NOT NULL, action TEXT,
@@ -2694,6 +2707,134 @@ async def _save_and_reply(interaction: discord.Interaction, key: str, value: str
 
 
 # =====================================================================
+# Personal QR / UPI system
+# =====================================================================
+
+_UPI_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,255}@[A-Za-z0-9][A-Za-z0-9.-]{0,63}$")
+_MAX_QR_UPLOAD_BYTES = 5 * 1024 * 1024
+
+
+def normalize_upi_id(raw: str) -> Optional[str]:
+    value = (raw or "").strip()
+    if not value or not _UPI_RE.fullmatch(value):
+        return None
+    return value
+
+
+def parse_amount(raw: Optional[str]) -> Optional[Decimal]:
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        amount = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError("Amount must be a valid number.")
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Amount must be greater than ₹0.")
+    if amount.as_tuple().exponent < -2:
+        raise ValueError("Amount can have at most 2 decimal places.")
+    if amount > Decimal("100000000"):
+        raise ValueError("Amount is too large.")
+    return amount.quantize(Decimal("0.01"))
+
+
+def build_upi_payload(upi_id: str, amount: Optional[Decimal], payee_name: str) -> str:
+    params = {
+        "pa": upi_id,
+        "pn": payee_name[:100] or "Discord User",
+        "cu": "INR",
+    }
+    if amount is not None:
+        params["am"] = f"{amount:.2f}"
+    return "upi://pay?" + urlencode(params)
+
+
+def generate_qr_file(upi_id: str, amount: Optional[Decimal], payee_name: str) -> discord.File:
+    payload = build_upi_payload(upi_id, amount, payee_name)
+    image = qrcode.make(payload)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    buf.seek(0)
+    return discord.File(buf, filename="payment-qr.png")
+
+
+async def _save_custom_qr(attachment: discord.Attachment, user_id: int) -> str:
+    if attachment.size and attachment.size > _MAX_QR_UPLOAD_BYTES:
+        raise ValueError("The QR image must be 5 MB or smaller.")
+
+    content_type = (attachment.content_type or "").lower()
+    filename = (attachment.filename or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise ValueError("The uploaded file must be an image.")
+    if not content_type and not filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        raise ValueError("Please upload a PNG, JPG, JPEG, or WEBP image.")
+
+    data = await attachment.read()
+    if len(data) > _MAX_QR_UPLOAD_BYTES:
+        raise ValueError("The QR image must be 5 MB or smaller.")
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.verify()
+        with Image.open(io.BytesIO(data)) as img:
+            if img.width < 32 or img.height < 32:
+                raise ValueError("The QR image is too small.")
+            img = img.convert("RGBA")
+            os.makedirs(QR_CUSTOM_DIR, exist_ok=True)
+            path = os.path.join(QR_CUSTOM_DIR, f"{user_id}.png")
+            img.save(path, format="PNG")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("That file is not a valid image.") from exc
+
+    return path
+
+
+async def _get_qr_profile(db: Database, user_id: int):
+    return await db.fetchone(
+        "SELECT user_id, upi_id, custom_qr_path, updated_at "
+        "FROM qr_profiles WHERE user_id=?",
+        (user_id,),
+    )
+
+
+async def _delete_custom_qr(path: Optional[str]):
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        log.exception("Failed to remove custom QR file: %s", path)
+
+
+def _qr_embed(user: discord.abc.User, upi_id: str,
+              amount: Optional[Decimal], generated: bool) -> discord.Embed:
+    e = discord.Embed(
+        title="💳 Payment QR",
+        description=f"Payment QR for {user.mention}",
+        color=0x5865F2,
+        timestamp=now_utc(),
+    )
+    e.add_field(name="UPI ID", value=f"`{upi_id}`", inline=False)
+    e.add_field(
+        name="Amount",
+        value=f"₹{amount:.2f}" if amount is not None else "Any amount",
+        inline=True,
+    )
+    e.add_field(
+        name="QR Source",
+        value="Generated from UPI ID" if generated else "Saved custom QR",
+        inline=True,
+    )
+    try:
+        e.set_thumbnail(url=user.display_avatar.url)
+    except Exception:
+        pass
+    return e
+
+
+# =====================================================================
 # Command registration
 # =====================================================================
 
@@ -2725,6 +2866,186 @@ def register_all_commands(bot: Freakos):
     async def ping(interaction: discord.Interaction):
         await interaction.response.send_message(
             f"🏓 Pong! `{round(bot.latency*1000)}ms`")
+
+    @tree.command(
+        name="qr",
+        description="Generate your personal UPI payment QR code."
+    )
+    @app_commands.describe(amount="Optional payment amount in INR, e.g. 100 or 99.50")
+    async def qr_cmd(interaction: discord.Interaction, amount: Optional[str] = None):
+        """Generate ONLY the QR belonging to the user running this command."""
+        profile = await db.fetchone(
+            "SELECT upi_id, custom_qr_path FROM qr_profiles WHERE user_id=?",
+            (interaction.user.id,),
+        )
+        if not profile:
+            return await _safe_reply(
+                interaction,
+                "❌ You haven't configured your payment details yet. "
+                "Use `/qr_setup` first."
+            )
+
+        upi_id = normalize_upi_id(profile["upi_id"])
+        if not upi_id:
+            return await _safe_reply(
+                interaction,
+                "❌ Your saved UPI ID is invalid. Please run `/qr_setup` again."
+            )
+
+        try:
+            parsed_amount = parse_amount(amount)
+        except ValueError as exc:
+            return await _safe_reply(interaction, f"❌ {exc}")
+
+        # A custom uploaded QR is static. If an amount is requested, generate
+        # a fresh QR so the amount encoded in it is correct.
+        custom_path = profile["custom_qr_path"]
+        use_custom = bool(custom_path and os.path.isfile(custom_path) and parsed_amount is None)
+
+        if use_custom:
+            try:
+                file = discord.File(custom_path, filename="payment-qr.png")
+            except Exception:
+                use_custom = False
+
+        if not use_custom:
+            file = generate_qr_file(
+                upi_id,
+                parsed_amount,
+                getattr(interaction.user, "display_name", None)
+                or interaction.user.name,
+            )
+
+        embed = _qr_embed(interaction.user, upi_id, parsed_amount, generated=not use_custom)
+        embed.set_image(url="attachment://payment-qr.png")
+
+        # Intentionally public: this is a payment QR meant to be visible in
+        # the channel. The data source is still isolated by interaction.user.id.
+        try:
+            await interaction.response.send_message(embed=embed, file=file, ephemeral=False)
+        except Exception:
+            log.exception("Failed to send QR for user %s", interaction.user.id)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ I couldn't send the QR code.", ephemeral=True
+                )
+
+    @tree.command(
+        name="qr_setup",
+        description="Set up your personal UPI ID and optional custom QR image."
+    )
+    @app_commands.describe(
+        upi_id="Your UPI ID, for example name@upi",
+        qr_image="Optional custom QR image (PNG/JPG/JPEG/WEBP).",
+    )
+    async def qr_setup_cmd(
+        interaction: discord.Interaction,
+        upi_id: str,
+        qr_image: Optional[discord.Attachment] = None,
+    ):
+        normalized = normalize_upi_id(upi_id)
+        if not normalized:
+            return await _safe_reply(
+                interaction,
+                "❌ Invalid UPI ID. Example: `name@upi`."
+            )
+
+        old = await db.fetchone(
+            "SELECT custom_qr_path FROM qr_profiles WHERE user_id=?",
+            (interaction.user.id,),
+        )
+
+        new_path = old["custom_qr_path"] if old else None
+        if qr_image is not None:
+            try:
+                new_path = await _save_custom_qr(qr_image, interaction.user.id)
+            except ValueError as exc:
+                return await _safe_reply(interaction, f"❌ {exc}")
+            except (discord.HTTPException, discord.Forbidden):
+                return await _safe_reply(
+                    interaction, "❌ I couldn't download that image from Discord."
+                )
+            except Exception:
+                log.exception("Failed to save custom QR for user %s", interaction.user.id)
+                return await _safe_reply(interaction, "❌ Failed to save the QR image.")
+
+        await db.execute(
+            "INSERT INTO qr_profiles (user_id, upi_id, custom_qr_path, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "upi_id=excluded.upi_id, custom_qr_path=excluded.custom_qr_path, "
+            "updated_at=excluded.updated_at",
+            (interaction.user.id, normalized, new_path, iso(now_utc())),
+        )
+
+        if old and old["custom_qr_path"] and old["custom_qr_path"] != new_path:
+            await _delete_custom_qr(old["custom_qr_path"])
+
+        custom_text = (
+            "Your custom QR image was saved."
+            if new_path else
+            "No custom image was saved; the bot will generate your QR automatically."
+        )
+        await _safe_reply(
+            interaction,
+            f"✅ **Payment setup saved.**\n"
+            f"UPI ID: `{normalized}`\n{custom_text}\n\n"
+            "Use `/qr` or `/qr amount:100` to generate your payment QR."
+        )
+
+    @tree.command(
+        name="qr_view",
+        description="View your personal QR payment setup."
+    )
+    async def qr_view_cmd(interaction: discord.Interaction):
+        profile = await db.fetchone(
+            "SELECT upi_id, custom_qr_path, updated_at FROM qr_profiles WHERE user_id=?",
+            (interaction.user.id,),
+        )
+        if not profile:
+            return await _safe_reply(
+                interaction, "❌ You haven't configured a personal QR yet. Use `/qr_setup`."
+            )
+
+        has_custom = bool(
+            profile["custom_qr_path"] and os.path.isfile(profile["custom_qr_path"])
+        )
+        embed = discord.Embed(
+            title="💳 Your QR Setup",
+            color=0x5865F2,
+            timestamp=now_utc(),
+        )
+        embed.add_field(name="UPI ID", value=f"`{profile['upi_id']}`", inline=False)
+        embed.add_field(
+            name="Custom QR",
+            value="Yes" if has_custom else "No — automatic QR generation",
+            inline=True,
+        )
+        embed.add_field(name="Updated", value=fmt_dt(parse_iso(profile["updated_at"])), inline=True)
+        try:
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        except Exception:
+            pass
+        await _safe_reply(interaction, embed=embed)
+
+    @tree.command(
+        name="qr_remove",
+        description="Remove your personal UPI ID and custom QR."
+    )
+    async def qr_remove_cmd(interaction: discord.Interaction):
+        profile = await db.fetchone(
+            "SELECT custom_qr_path FROM qr_profiles WHERE user_id=?",
+            (interaction.user.id,),
+        )
+        if not profile:
+            return await _safe_reply(interaction, "❌ You don't have a QR setup to remove.")
+
+        await db.execute(
+            "DELETE FROM qr_profiles WHERE user_id=?",
+            (interaction.user.id,),
+        )
+        await _delete_custom_qr(profile["custom_qr_path"])
+        await _safe_reply(interaction, "✅ Your personal UPI/QR setup has been removed.")
 
     @tree.command(name="sync", description="Force re-sync of slash commands.")
     @app_commands.default_permissions(administrator=True)
