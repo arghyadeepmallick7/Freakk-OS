@@ -1348,6 +1348,211 @@ async def _log_guild(bot: "Freakos", guild: discord.Guild, event_key: str,
 
 
 # =====================================================================
+# Notify DM Broadcast (/notify)
+# =====================================================================
+#
+# Guild-isolation contract for this feature:
+#   * Every role is resolved via `interaction.guild.get_role(...)`.
+#   * Every member is resolved via that role's own `.members` property,
+#     which discord.py scopes to the role's guild.
+#   * We additionally double-check `member.guild.id == guild.id` before
+#     sending, as defense in depth against any future refactor.
+#   * We never call a bot-wide/global member search of any kind.
+
+NOTIFY_DM_DELAY_SECONDS = 0.4          # sequential pacing between DMs
+NOTIFY_PROGRESS_EVERY = 15             # edit the status panel every N sends
+NOTIFY_MESSAGE_MAX_LEN = 4000          # comfortably under Discord's 4096 embed cap
+NOTIFY_ROLE_SELECT_TIMEOUT = 180       # seconds the role picker stays active
+
+
+class NotifyMessageModal(discord.ui.Modal, title="Notification Message"):
+    message = discord.ui.TextInput(
+        label="Message",
+        style=discord.TextStyle.paragraph,
+        max_length=NOTIFY_MESSAGE_MAX_LEN,
+        required=True,
+        placeholder="Type the message to DM to the selected members…")
+
+    def __init__(self, role_ids: list[int]):
+        super().__init__()
+        self.role_ids = role_ids
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        bot: "Freakos" = interaction.client
+        if guild is None:
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+        content = (self.message.value or "").strip()
+        if not content:
+            return await interaction.response.send_message(
+                "❌ Message can't be empty.", ephemeral=True)
+        if len(content) > NOTIFY_MESSAGE_MAX_LEN:
+            return await interaction.response.send_message(
+                "❌ Message is too long for a DM/embed. Please shorten it and "
+                "run `/notify` again — nothing was sent.", ephemeral=True)
+
+        # Re-resolve roles from THIS guild only. A role id from another guild
+        # simply won't resolve here, and any role deleted between selection
+        # and submission is dropped instead of crashing.
+        roles: list[discord.Role] = []
+        dropped = False
+        for rid in self.role_ids:
+            r = guild.get_role(rid)
+            if r is not None:
+                roles.append(r)
+            else:
+                dropped = True
+        if not roles:
+            return await interaction.response.send_message(
+                "❌ None of the selected role(s) are available on this server "
+                "anymore. Please run `/notify` again.", ephemeral=True)
+
+        # Make sure we have a full member list for this guild before
+        # collecting role members (large guilds may not be fully chunked yet).
+        if not guild.chunked:
+            try:
+                await guild.chunk(cache=True)
+            except Exception:
+                log.exception("notify: failed to chunk guild %s", guild.id)
+
+        # "At least one selected role" + automatic de-duplication via dict keys.
+        targets: dict[int, discord.Member] = {}
+        for r in roles:
+            for m in r.members:
+                if m.guild is None or m.guild.id != guild.id:
+                    continue  # defensive: never let a member cross a guild boundary
+                targets[m.id] = m
+
+        bot_user_id = bot.user.id if bot.user else None
+        if bot_user_id is not None:
+            targets.pop(bot_user_id, None)
+
+        role_names = ", ".join(r.mention for r in roles) or "—"
+        total = len(targets)
+
+        status = make_embed(title="FREAKK OS", description="🔔 Notification started.")
+        status.add_field(name="Target roles", value=role_names, inline=False)
+        status.add_field(name="Server", value=guild.name, inline=False)
+        status.add_field(name="Members found", value=str(total), inline=True)
+        if dropped:
+            status.add_field(
+                name="Note", value="Some selected roles were no longer valid and were skipped.",
+                inline=False)
+
+        await interaction.response.send_message(embed=status, ephemeral=True)
+
+        if total == 0:
+            status.add_field(name="DMs sent", value="0", inline=True)
+            status.add_field(name="Failed", value="0", inline=True)
+            try:
+                await interaction.edit_original_response(embed=status)
+            except Exception:
+                pass
+            return
+
+        sent = 0
+        failed = 0
+        for i, member in enumerate(targets.values(), start=1):
+            dm_embed = make_embed(title="FREAKK OS", description=content)
+            dm_embed.set_footer(text=f"From: {guild.name}")
+            try:
+                await member.send(embed=dm_embed)
+                sent += 1
+            except discord.Forbidden:
+                # DMs disabled / bot blocked — expected, just count it.
+                failed += 1
+            except discord.HTTPException:
+                # Includes rate-limit errors discord.py couldn't absorb; the
+                # HTTP layer already retries on 429 using Discord's
+                # retry_after, so reaching here means a genuine failure.
+                failed += 1
+            except Exception:
+                log.exception("notify: unexpected DM failure for member %s", member.id)
+                failed += 1
+
+            is_last = (i == total)
+            if is_last or i % NOTIFY_PROGRESS_EVERY == 0:
+                progress = make_embed(
+                    title="FREAKK OS",
+                    description=("✅ Notification completed." if is_last
+                                 else "🔔 Notification in progress…"))
+                progress.add_field(name="Target roles", value=role_names, inline=False)
+                progress.add_field(name="Server", value=guild.name, inline=False)
+                progress.add_field(name="Members found", value=str(total), inline=True)
+                progress.add_field(name="DMs sent", value=str(sent), inline=True)
+                progress.add_field(name="Failed", value=str(failed), inline=True)
+                try:
+                    await interaction.edit_original_response(embed=progress)
+                except Exception:
+                    pass
+
+            if not is_last:
+                # Sequential, paced sending — never asyncio.gather() a flood
+                # of DMs. discord.py's HTTP layer also queues/retries on 429s.
+                await asyncio.sleep(NOTIFY_DM_DELAY_SECONDS)
+
+        await _log_guild(
+            bot, guild, "notify", "Notification Broadcast",
+            f"**By:** {interaction.user.mention}\n**Roles:** {role_names}\n"
+            f"**Targeted:** {total} · **Sent:** {sent} · **Failed:** {failed}")
+
+
+class NotifyRoleSelectView(discord.ui.View):
+    """Ephemeral role picker shown right after `/notify` is run.
+
+    Uses Discord's native multi-role select component (guild-scoped by
+    Discord itself) so the command user can pick multiple roles without
+    typing anything.
+    """
+
+    def __init__(self, invoker_id: int):
+        super().__init__(timeout=NOTIFY_ROLE_SELECT_TIMEOUT)
+        self.invoker_id = invoker_id
+        self.message: Optional[discord.InteractionMessage] = None
+
+        self.role_select = discord.ui.RoleSelect(
+            placeholder="Select one or more roles to notify…",
+            min_values=1, max_values=25)
+        self.role_select.callback = self._on_select
+        self.add_item(self.role_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/notify` can use this.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+        # discord.py resolves RoleSelect values into real discord.Role
+        # objects for THIS guild already; filter defensively anyway.
+        role_ids = [r.id for r in self.role_select.values
+                   if guild.get_role(r.id) is not None]
+        if not role_ids:
+            return await interaction.response.send_message(
+                "❌ None of the selected roles are valid anymore. "
+                "Please run `/notify` again.", ephemeral=True)
+
+        # Opening a modal must happen directly off this component
+        # interaction (cannot be deferred first).
+        await interaction.response.send_modal(NotifyMessageModal(role_ids))
+
+    async def on_timeout(self):
+        for c in self.children:
+            c.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+# =====================================================================
 # AutoMod engine
 # =====================================================================
 
@@ -3066,6 +3271,36 @@ def register_all_commands(bot: Freakos):
             log.exception("Manual sync failed")
             await interaction.followup.send(f"❌ Sync failed: {e}", ephemeral=True)
 
+    # ---------------- NOTIFY (DM role broadcast) ----------------
+    @tree.command(
+        name="notify",
+        description="DM every member who has at least one of the roles you pick (staff only).")
+    @app_commands.default_permissions(manage_guild=True)
+    async def notify_broadcast_cmd(interaction: discord.Interaction):
+        if not interaction.guild:
+            return await interaction.response.send_message("Guild only.", ephemeral=True)
+        # Server-side permission check (Discord's default_permissions above is
+        # only a UI default — server admins can loosen it in Integrations
+        # settings, so this is verified again here, matching every other
+        # admin-ish command in this bot).
+        if not is_admin_or_mod(interaction.user):
+            return await interaction.response.send_message(
+                "❌ You need Manage Server / Administrator to use this.",
+                ephemeral=True)
+
+        view = NotifyRoleSelectView(interaction.user.id)
+        embed = make_embed(
+            title="FREAKK OS — Notify",
+            description="Select one or more roles below. Anyone with **at least "
+                        "one** of the selected roles will get a DM.\n\n"
+                        f"This only affects **{interaction.guild.name}** — members "
+                        "of other servers are never contacted.")
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except Exception:
+            pass
+
     @tree.command(name="serverinfo", description="Show server info.")
     async def serverinfo(interaction: discord.Interaction):
         g = interaction.guild
@@ -3119,7 +3354,8 @@ def register_all_commands(bot: Freakos):
             "Vouches": ["vouch"],
             "Shop": ["shop"],
             "Orders": ["order"],
-            "Notifications": ["notify"],
+            "Notify (DM broadcast)": ["notify"],
+            "Notification Presets": ["notify-presets"],
             "AutoMod": ["automod"],
             "Moderation": ["warn", "warnings", "clearwarnings", "timeout",
                            "untimeout", "kick", "ban", "unban", "purge",
@@ -3157,7 +3393,7 @@ def register_all_commands(bot: Freakos):
             ("Vouches", bool(await db.get_config(g.id, "vouch.channel"))),
             ("Shop", bool(await db.fetchall(
                 "SELECT 1 FROM shop_products WHERE guild_id=?", (g.id,)))),
-            ("Notifications", bool(await db.get_config(g.id, "notify.channel"))),
+            ("Notification Presets", bool(await db.get_config(g.id, "notify.channel"))),
             ("AutoMod", await db.get_config(g.id, "automod.enabled", "0") == "1"),
             ("Logging", bool(await db.get_config(g.id, "logging.channel"))),
             ("Reaction Roles", bool(await db.fetchall(
@@ -3176,8 +3412,9 @@ def register_all_commands(bot: Freakos):
             description=("Use the subcommands of each group to configure systems:\n"
                          "`/welcome`, `/autorole`, `/autonick`, `/departure`, "
                          "`/actiondm`, `/vcnotify`, `/ticket`, `/vouch`, `/shop`, "
-                         "`/order`, `/notify`, `/automod`, `/logging`, "
-                         "`/reactionrole`, `/giveaway`, `/customcommand`, `/announce`.\n\n"
+                         "`/order`, `/notify`, `/notify-presets`, `/automod`, "
+                         "`/logging`, `/reactionrole`, `/giveaway`, "
+                         "`/customcommand`, `/announce`.\n\n"
                          "**Current status:**\n" + "\n".join(lines)))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -4291,8 +4528,8 @@ def register_all_commands(bot: Freakos):
             (iso(now_utc()), order_id, interaction.guild.id))
         await interaction.response.send_message("✅ Completed.", ephemeral=True)
 
-    # ---------------- NOTIFICATIONS ----------------
-    notify = app_commands.Group(name="notify", description="Notification channel")
+    # ---------------- NOTIFICATION PRESETS (channel-based preset messages) ----------------
+    notify = app_commands.Group(name="notify-presets", description="Preset notification messages")
     tree.add_command(notify)
 
     @notify.command(name="setup", description="Set notify channel.")
