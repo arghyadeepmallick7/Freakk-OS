@@ -701,6 +701,54 @@ async def _generate_transcript(channel) -> discord.File:
     return discord.File(buf, filename=f"transcript-{channel.id}.txt")
 
 
+async def _dm_ticket_transcript(bot: "Freakos", guild: discord.Guild, channel,
+                                row, closed_by, reason: str):
+    """DM the ticket creator a transcript immediately when their ticket closes."""
+    creator = guild.get_member(row["user_id"])
+    if creator is None:
+        try:
+            creator = await guild.fetch_member(row["user_id"])
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            creator = None
+
+    if creator is None:
+        log.warning("Ticket %s creator %s is no longer available in guild %s",
+                    row["id"], row["user_id"], guild.id)
+        return False
+
+    ticket_num = row["ticket_number"]
+    ticket_num_str = f"#{ticket_num:03d}" if ticket_num else f"#{row['id']}"
+    dm = discord.Embed(
+        title="📄 Ticket Transcript",
+        description=(
+            f"Your ticket **{ticket_num_str}** in **{guild.name}** has been closed.\n\n"
+            f"**Close reason:** {reason or 'No reason specified'}"
+        ),
+        color=0x5865F2,
+        timestamp=now_utc(),
+    )
+    if guild.icon:
+        dm.set_thumbnail(url=guild.icon.url)
+    dm.add_field(name="Ticket", value=ticket_num_str, inline=True)
+    dm.add_field(name="Closed by", value=closed_by.mention, inline=True)
+    dm.add_field(name="Reason", value=(reason or "No reason specified")[:1024], inline=False)
+    dm.set_footer(text=f"{guild.name} • FREAKK OS")
+
+    try:
+        await creator.send(
+            embed=dm,
+            file=await _generate_transcript(channel),
+        )
+        return True
+    except discord.Forbidden:
+        log.info("Could not DM transcript for ticket %s: DMs unavailable", row["id"])
+    except discord.HTTPException:
+        log.exception("Discord rejected transcript DM for ticket %s", row["id"])
+    except Exception:
+        log.exception("Unexpected error while DMing transcript for ticket %s", row["id"])
+    return False
+
+
 async def _post_ticket_close_log(bot: "Freakos", guild: discord.Guild, channel,
                                  row, closed_by, reason: str):
     ch_id = await bot.db.get_config(guild.id, "ticket.logs_channel")
@@ -838,6 +886,12 @@ async def _close_ticket_room(interaction: discord.Interaction, ticket_id: int,
         await _safe_reply(interaction, closing_text, ephemeral=False)
     except Exception:
         log.exception("Failed to send close message")
+
+    # Send the creator their transcript before the ticket channel is deleted.
+    # This is independent of the staff log, so a failed DM never breaks closure.
+    await _dm_ticket_transcript(
+        interaction.client, interaction.guild, interaction.channel,
+        row, interaction.user, reason)
 
     await _post_ticket_close_log(interaction.client, interaction.guild,
                                  interaction.channel, row, interaction.user, reason)
@@ -1454,8 +1508,26 @@ class NotifyMessageModal(discord.ui.Modal, title="Notification Message"):
         sent = 0
         failed = 0
         for i, member in enumerate(targets.values(), start=1):
-            dm_embed = make_embed(title="FREAKK OS", description=content)
-            dm_embed.set_footer(text=f"From: {guild.name}")
+            # Rich DM design: the server icon is a small thumbnail, while the
+            # user's message remains the main content. This avoids the plain/default
+            # embed look while still giving every notification a clear server identity.
+            dm_embed = discord.Embed(
+                title=f"📢  {guild.name}  •  FREAKK OS",
+                description=content,
+                color=0x8B5CF6,
+                timestamp=now_utc(),
+            )
+            if guild.icon:
+                dm_embed.set_thumbnail(url=guild.icon.url)
+                dm_embed.set_author(name=guild.name, icon_url=guild.icon.url)
+            else:
+                dm_embed.set_author(name=guild.name)
+            dm_embed.add_field(
+                name="🔔 Server Notification",
+                value="This notification was sent from the Discord server above.",
+                inline=False,
+            )
+            dm_embed.set_footer(text=f"{guild.name}  •  Official Server Notification")
             try:
                 await member.send(embed=dm_embed)
                 sent += 1
